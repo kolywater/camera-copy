@@ -32,9 +32,9 @@
 #   bin          STATUS.BIN and similar camera status files
 #   ind          SONYCARD.IND, the card's index
 #   bdm cpi mpl  AVCHD index files that Sony cameras create even if you never shoot AVCHD
-#   THMBNL/      the folder of small clip previews (JPGs, but not real photos)
+#   PRIVATE/M4ROOT/THMBNL/*.JPG   Sony's small clip previews: only JPGs, only directly in that folder
+#                                 (anything else in a THMBNL folder still counts as MISSING)
 known_extra_types="xml bin ind bdm cpi mpl"
-known_extra_folder="THMBNL"
 
 set -u
 [ $# -eq 2 ] || { echo "Usage: verify-card.sh <card-folder> <destination-folder>"; exit 2; }
@@ -44,16 +44,20 @@ card=$(cd -- "$1" 2>/dev/null && pwd -P) || { echo "Can't open the card folder: 
 dest=$(cd -- "$2" 2>/dev/null && pwd -P) || { echo "Can't open the destination folder: $2"; exit 2; }
 
 # Refuse a mix-up: if one folder is inside the other, the check would pass without proving anything.
-[ "$card" != "$dest" ] || { echo "The card and the destination are the same folder."; exit 2; }
-case "$dest/" in "$card/"*) echo "The destination is inside the card folder. Check the order: card first."; exit 2;; esac
-case "$card/" in "$dest/"*) echo "The card folder is inside the destination. Check the order: card first."; exit 2;; esac
+# Compared in lowercase, because Mac disks usually treat "Card" and "card" as the same folder.
+card_lc=$(printf '%s' "$card" | tr '[:upper:]' '[:lower:]'); dest_lc=$(printf '%s' "$dest" | tr '[:upper:]' '[:lower:]')
+[ "$card_lc" != "$dest_lc" ] || { echo "The card and the destination are the same folder."; exit 2; }
+case "$dest_lc/" in "$card_lc/"*) echo "The destination is inside the card folder. Check the order: card first."; exit 2;; esac
+case "$card_lc/" in "$dest_lc/"*) echo "The card folder is inside the destination. Check the order: card first."; exit 2;; esac
 [ -d "$card/DCIM" ] || [ -d "$card/PRIVATE" ] || [ "${card##*/}" = DCIM ] || echo "Note: $card has no DCIM or PRIVATE folder. Is it the card?"
 
-# Is this card file one of Sony's known extras? (Checks the folder, then the type, ignoring case.)
+# Is this card file one of Sony's known extras? (Checks the clip previews, then the type, ignoring case.)
 is_known_extra() {
   path=$(printf '%s' "/${1#"$card"/}" | tr '[:upper:]' '[:lower:]')    # its place on the card, in lowercase
-  folder=$(printf '%s' "$known_extra_folder" | tr '[:upper:]' '[:lower:]')
-  case "$path" in */"$folder"/*) return 0 ;; esac
+  case "$path" in
+    /private/m4root/thmbnl/*/*) ;;                     # inside a subfolder of THMBNL: not a preview
+    /private/m4root/thmbnl/*.jpg) return 0 ;;          # Sony's clip previews: JPGs directly in that folder
+  esac
   name=${path##*/}
   case "$name" in *.*) ;; *) return 1 ;; esac            # no type at all: not a known extra
   case " $known_extra_types " in *" ${name##*.} "*) return 0 ;; esac
