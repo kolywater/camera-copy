@@ -17,9 +17,24 @@
 #   - the folders .Spotlight-V100, .Trashes and .fseventsd, with everything in them
 # The number of skipped items is printed at the end. Symlinks are ignored (cameras don't make them).
 #
+# What a miss means: a card file with no match in the destination is MISSING, and the check
+# fails, unless it is one of Sony's known extra files below. Camera Copy copies only photos and
+# videos, so those extras are listed as "not copied, not a photo/video" and counted, but don't
+# fail the check. Any other file type (e.g. .CR3, .NEF, .WAV) counts as MISSING, so a new kind of
+# file can never pass quietly.
+#
 # Read-only: it never writes, moves or deletes anything on the card or in the destination.
 # It keeps its two working lists in a temporary folder and deletes that folder when it ends.
 # It doesn't use Camera Copy's code or its checksums file.
+
+# Sony's known extra files (not photos or videos). Letter case doesn't matter.
+#   xml          clip sidecars (C0001M01.XML) and MEDIAPRO.XML
+#   bin          STATUS.BIN and similar camera status files
+#   ind          SONYCARD.IND, the card's index
+#   bdm cpi mpl  AVCHD index files that Sony cameras create even if you never shoot AVCHD
+#   THMBNL/      the folder of small clip previews (JPGs, but not real photos)
+known_extra_types="xml bin ind bdm cpi mpl"
+known_extra_folder="THMBNL"
 
 set -u
 [ $# -eq 2 ] || { echo "Usage: verify-card.sh <card-folder> <destination-folder>"; exit 2; }
@@ -33,6 +48,17 @@ dest=$(cd -- "$2" 2>/dev/null && pwd -P) || { echo "Can't open the destination f
 case "$dest/" in "$card/"*) echo "The destination is inside the card folder. Check the order: card first."; exit 2;; esac
 case "$card/" in "$dest/"*) echo "The card folder is inside the destination. Check the order: card first."; exit 2;; esac
 [ -d "$card/DCIM" ] || [ -d "$card/PRIVATE" ] || [ "${card##*/}" = DCIM ] || echo "Note: $card has no DCIM or PRIVATE folder. Is it the card?"
+
+# Is this card file one of Sony's known extras? (Checks the folder, then the type, ignoring case.)
+is_known_extra() {
+  path=$(printf '%s' "/${1#"$card"/}" | tr '[:upper:]' '[:lower:]')    # its place on the card, in lowercase
+  folder=$(printf '%s' "$known_extra_folder" | tr '[:upper:]' '[:lower:]')
+  case "$path" in */"$folder"/*) return 0 ;; esac
+  name=${path##*/}
+  case "$name" in *.*) ;; *) return 1 ;; esac            # no type at all: not a known extra
+  case " $known_extra_types " in *" ${name##*.} "*) return 0 ;; esac
+  return 1
+}
 
 # A temporary folder for the two working lists, deleted when the script ends.
 work=$(mktemp -d) || exit 2
@@ -55,14 +81,19 @@ find "$dest" "${skip_dirs[@]}" -o -type f ! \( "${skip_files[@]}" \) -exec shasu
 
 # Step 3: go through the card one file at a time, fingerprint it, and look for it in the destination.
 echo "Checking the card…"
-total=0; missing=0
+total=0; missing=0; extras=0
+missing_list=(); extras_list=()
 while IFS= read -r -d '' file; do
   total=$((total + 1))
   print=$(shasum -a 256 2>/dev/null < "$file" | cut -c1-64)
   if [ -z "$print" ]; then
-    echo "UNREADABLE: $file"; missing=$((missing + 1))      # couldn't read it, so it can't be confirmed
-  elif ! grep -qxF -- "$print" "$work/dest-prints"; then
-    echo "MISSING: $file"; missing=$((missing + 1))         # no file in the destination has these contents
+    missing_list+=("UNREADABLE: $file"); missing=$((missing + 1))   # couldn't read it, so it can't be confirmed
+  elif grep -qxF -- "$print" "$work/dest-prints"; then
+    :                                                       # found in the destination: all good
+  elif is_known_extra "$file"; then
+    extras_list+=("  $file"); extras=$((extras + 1))      # listed, but doesn't fail
+  else
+    missing_list+=("MISSING: $file"); missing=$((missing + 1))   # no file in the destination has these contents
   fi
 done < "$work/card-files"
 
@@ -70,8 +101,16 @@ done < "$work/card-files"
 skipped=$(find "$card" "${skip_dirs[@]}" -print -o -type f \( "${skip_files[@]}" \) -print | wc -l | tr -d ' ')
 echo "Skipped $skipped macOS housekeeping item(s) on the card (._ files, .DS_Store; a system folder counts as one)."
 
-# Step 5: the verdict, naming both folders so a mix-up shows.
+# Step 5: the two lists. Sony's extras first (they don't fail), then anything missing (it fails).
+if [ "$extras" -gt 0 ]; then
+  echo "Not copied, not a photo/video ($extras Sony extra file(s); these don't fail the check):"
+  printf '%s\n' "${extras_list[@]}"
+fi
+[ "$missing" -eq 0 ] || printf '%s\n' "${missing_list[@]}"
+
+# Step 6: the verdict, naming both folders so a mix-up shows.
 # Exit code 0: everything is there. 1: something is missing or unreadable. 2: wrong usage or nothing to check.
 if [ "$total" -eq 0 ]; then echo "NO FILES: nothing to check on $card."; exit 2; fi
-if [ "$missing" -eq 0 ]; then echo "OK: all $total files on $card are in $dest"; exit 0; fi
+if [ "$missing" -eq 0 ] && [ "$extras" -eq 0 ]; then echo "OK: all $total files on $card are in $dest"; exit 0; fi
+if [ "$missing" -eq 0 ]; then echo "OK: all $((total - extras)) files on $card are in $dest, apart from the $extras Sony extras above"; exit 0; fi
 echo "MISSING: $missing of $total files on $card are not in $dest"; exit 1
