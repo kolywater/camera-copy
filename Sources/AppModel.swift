@@ -47,6 +47,10 @@ final class AppModel {
 
     var bytesDone: Int64 = 0
     var bytesTotal: Int64 = 0
+    /// "About 4 min left" while importing; "Estimating…" for the first few seconds.
+    var timeLeftText: String?
+    /// Lets a quick retry's time-left loop take over from the previous run's.
+    @ObservationIgnored private var runGeneration = 0
     var currentIndex = 0
     var currentFileName = ""
     var wasCancelled = false
@@ -464,6 +468,7 @@ final class AppModel {
         bytesDone = 0
         bytesTotal = files.reduce(0) { $0 + $1.size } * 3   // copy + read back the copy + re-read the card
         runCount = files.count
+        timeLeftText = "Estimating…"
         currentIndex = 0
         wasCancelled = false
         manifestError = nil
@@ -475,6 +480,20 @@ final class AppModel {
         let manifestName = manifestFileName
         sleepActivity = ProcessInfo.processInfo.beginActivity(
             options: [.userInitiated, .idleSystemSleepDisabled], reason: "Copying photos and videos")
+
+        // Once a second, update the time left from the bytes done so far.
+        runGeneration += 1
+        let generation = runGeneration
+        Task { @MainActor in
+            var estimator = TimeLeftEstimator()
+            while self.phase == .importing && self.runGeneration == generation {
+                if let seconds = estimator.sample(done: self.bytesDone, total: self.bytesTotal) {
+                    self.timeLeftText = TimeLeftEstimator.text(seconds)
+                }
+                try? await Task.sleep(for: .seconds(1))
+            }
+            if self.runGeneration == generation { self.timeLeftText = nil }
+        }
 
         Task.detached(priority: .userInitiated) {
             for (index, file) in files.enumerated() {

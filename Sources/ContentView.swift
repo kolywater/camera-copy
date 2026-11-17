@@ -291,6 +291,14 @@ struct ImportProgress: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
             ProgressView(value: Double(model.bytesDone), total: Double(max(model.bytesTotal, 1)))
+            if let timeLeft = model.timeLeftText {
+                // Covers the whole job, verification included, so it reaches zero when the import ends.
+                Text(timeLeft)
+                    .font(.caption.weight(.medium))
+                    .monospacedDigit()
+                    .contentTransition(.numericText())
+                    .animation(.default, value: timeLeft)
+            }
             HStack {
                 Text("\(Format.count(model.currentIndex)) of \(Format.count(model.runCount))")
                     .monospacedDigit()
