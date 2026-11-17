@@ -1,0 +1,5 @@
+build/
+CameraCopy.xcodeproj/
+.DS_Store
+build-dist/
+dist/
