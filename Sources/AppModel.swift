@@ -59,6 +59,9 @@ final class AppModel {
     var scanError: String?
     var alertMessage: String?
 
+    /// The separate verify-card.sh check. It only runs when the user clicks "Run Independent Check".
+    var independentCheck = IndependentCheck()
+
     /// The names CardScanner gave each file, used as-is in new-folder mode.
     @ObservationIgnored private var scannedDestNames: [String: String] = [:]
     /// Every name in the destination folder before this import started. Those files are never replaced.
@@ -329,8 +332,39 @@ final class AppModel {
         return listing
     }
 
+    /// The card and folder of the last finished import, offered to the independent check.
+    var lastImport: (card: String, folder: String)? {
+        guard phase == .done, let destinationURL, !sourcePath.isEmpty else { return nil }
+        return (sourcePath, destinationURL.path)
+    }
+
+    /// Runs verify-card.sh on the last import's card and folder.
+    func runIndependentCheckOnLastImport() {
+        guard let target = lastImport, !sourceEjected else { return }
+        independentCheck.run(card: target.card, folder: target.folder)
+    }
+
+    /// Asks for any card (or folder copied from one) and any folder, then runs verify-card.sh on them.
+    func chooseAndRunIndependentCheck() {
+        guard phase != .importing else { return }
+        let card = NSOpenPanel()
+        card.canChooseDirectories = true; card.canChooseFiles = false
+        card.directoryURL = URL(fileURLWithPath: sourcePath.isEmpty ? "/Volumes" : sourcePath)
+        card.message = "Choose the card to check (its top folder, so videos in PRIVATE are included)."
+        card.prompt = "Use This Card"
+        guard card.runModal() == .OK, let cardURL = card.url else { return }
+        let folder = NSOpenPanel()
+        folder.canChooseDirectories = true; folder.canChooseFiles = false
+        folder.directoryURL = URL(fileURLWithPath: destinationURL?.path ?? parentPath)
+        folder.message = "Choose the folder this card was imported into."
+        folder.prompt = "Check This Folder"
+        guard folder.runModal() == .OK, let folderURL = folder.url else { return }
+        independentCheck.run(card: cardURL.path, folder: folderURL.path)
+    }
+
     func scanSource() {
         guard phase != .importing else { return }
+        independentCheck.reset()
         let path = sourcePath.trimmingCharacters(in: .whitespacesAndNewlines)
         resetResults()
         sourceEjected = false
@@ -465,6 +499,7 @@ final class AppModel {
     }
 
     private func run(_ files: [CardFile], into dest: URL) {
+        independentCheck.reset()       // its result belonged to the folder as it was before this import
         bytesDone = 0
         bytesTotal = files.reduce(0) { $0 + $1.size } * 3   // copy + read back the copy + re-read the card
         runCount = files.count
@@ -599,6 +634,10 @@ final class AppModel {
     }
 
     func ejectCard() {
+        guard !independentCheck.isRunning else {
+            alertMessage = "The independent check is still reading the card. Stop it or wait for it to finish, then eject."
+            return
+        }
         let url = URL(fileURLWithPath: sourcePath)
         let volume = (try? url.resourceValues(forKeys: [.volumeURLKey]).volume) ?? url
         do {

@@ -219,6 +219,9 @@ struct Sidebar: View {
             } else if model.phase == .done {
                 Section("Result") { ResultSummary(model: model) }
             }
+            if model.phase != .importing {
+                IndependentCheckSection(model: model)
+            }
         }
         .formStyle(.grouped)
         .safeAreaInset(edge: .bottom) {
@@ -356,7 +359,7 @@ struct ResultSummary: View {
         }
         LabeledContent("Card") {
             Button(model.sourceEjected ? "Ejected" : "Eject") { model.ejectCard() }
-                .disabled(!model.allVerified || model.sourceEjected)
+                .disabled(!model.allVerified || model.sourceEjected || model.independentCheck.isRunning)
                 .help(model.allVerified ? "Safely eject the card" : "Not every file verified")
         }
     }

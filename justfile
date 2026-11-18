@@ -89,9 +89,19 @@ release version:
     sed -i '' -E "s/(MARKETING_VERSION: )\"?[0-9.]+\"?/\1\"$version\"/" project.yml
     grep -q "MARKETING_VERSION: \"$version\"" project.yml || { echo "Error: couldn't set the version in project.yml"; exit 1; }
 
-    just package
+    # Only a notarized, stapled build may be published. On any failure, undo the version bump and stop:
+    # nothing is committed, tagged, pushed or released.
+    if ! just package; then
+        git checkout -- project.yml
+        echo "Error: the build or notarization failed, so nothing was released (no tag, no GitHub release)."; exit 1
+    fi
+    if ! xcrun stapler validate -q "{{dist_app}}" || ! spctl --assess --type execute "{{dist_app}}" 2>/dev/null; then
+        git checkout -- project.yml
+        echo "Error: the app isn't notarized (is the 'notary' keychain profile set up? xcrun notarytool store-credentials notary),"
+        echo "so nothing was released (no tag, no GitHub release)."; exit 1
+    fi
     built=$(/usr/libexec/PlistBuddy -c "Print CFBundleShortVersionString" "{{dist_app}}/Contents/Info.plist")
-    if [[ "$built" != "$version" ]]; then echo "Error: built app says $built, expected $version"; exit 1; fi
+    if [[ "$built" != "$version" ]]; then git checkout -- project.yml; echo "Error: built app says $built, expected $version"; exit 1; fi
     zip="dist/CameraCopy-$version.zip"
     cp dist/CameraCopy.zip "$zip"
 
@@ -101,8 +111,5 @@ release version:
     git push origin HEAD
     git push origin "$tag"
 
-    if ! xcrun stapler validate -q "{{dist_app}}" 2>/dev/null; then
-        echo "⚠️  This build isn't notarized. In-app updates still work; a first download by hand will need right-click > Open."
-    fi
     gh release create "$tag" "$zip" --title "Camera Copy $version" --generate-notes
     echo "Released $tag"

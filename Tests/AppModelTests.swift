@@ -196,6 +196,32 @@ final class AppModelTests: TempDirTestCase {
         XCTAssertEqual(m.sourceDisplayName, "no card")
     }
 
+    func testIndependentCheckWaitsForTheClickThenChecksTheLastImport() async throws {
+        try makeCard()
+        let m = try await readyModel()
+        m.independentCheck = IndependentCheck(scriptURL: Bundle(for: AppModelTests.self).url(forResource: "verify-card", withExtension: "sh"))
+        XCTAssertNil(m.lastImport)
+        m.folderName = "Shoot"
+        m.startImport()
+        try await wait(m, for: .done)
+        try await Task.sleep(for: .milliseconds(300))
+        XCTAssertEqual(m.independentCheck.state, .idle, "nothing runs until Aiden clicks")
+        let target = try XCTUnwrap(m.lastImport)
+        XCTAssertEqual(target.card, card.path)
+        XCTAssertEqual(target.folder, out.appendingPathComponent("Shoot").path)
+
+        m.runIndependentCheckOnLastImport()
+        XCTAssertTrue(m.independentCheck.isRunning)
+        m.ejectCard()
+        XCTAssertTrue(m.alertMessage?.contains("still reading the card") == true, "no eject while it reads the card")
+        while m.independentCheck.isRunning { try await Task.sleep(for: .milliseconds(20)) }
+        XCTAssertEqual(m.independentCheck.state, .passed, m.independentCheck.output)
+        XCTAssertEqual(m.independentCheck.extraFiles.count, 1, "the clip's XML sidecar is listed, not failed")
+
+        m.scanSource()                                   // a new card: the old result no longer applies
+        XCTAssertEqual(m.independentCheck.state, .idle)
+    }
+
     private func snapshot(_ dir: URL) throws -> [String: String] {
         var r: [String: String] = [:]
         for n in try names(in: dir) { r[n] = try Data(contentsOf: dir.appendingPathComponent(n)).sha256Hex }

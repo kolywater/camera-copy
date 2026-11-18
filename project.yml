@@ -7,7 +7,22 @@ targets:
   CameraCopy:
     type: application
     platform: macOS
-    sources: [Sources]
+    sources:
+      - Sources
+      # The independent check, bundled unchanged (Camera Copy runs it with /bin/bash).
+      - path: tools/verify-card.sh
+        buildPhase: resources
+    postBuildScripts:
+      - name: Check bundled verify-card.sh is byte-for-byte tools/verify-card.sh
+        basedOnDependencyAnalysis: false
+        inputFiles:
+          - $(SRCROOT)/tools/verify-card.sh
+          - $(TARGET_BUILD_DIR)/$(UNLOCALIZED_RESOURCES_FOLDER_PATH)/verify-card.sh
+        script: |
+          if ! cmp -s "$SRCROOT/tools/verify-card.sh" "$TARGET_BUILD_DIR/$UNLOCALIZED_RESOURCES_FOLDER_PATH/verify-card.sh"; then
+            echo "error: the bundled verify-card.sh differs from tools/verify-card.sh"
+            exit 1
+          fi
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.aiden.CameraCopy
@@ -37,6 +52,8 @@ targets:
       - path: Sources
         excludes: ["CameraCopyApp.swift", "Assets.xcassets"]
       - Tests
+      - path: tools/verify-card.sh
+        buildPhase: resources
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.aiden.CameraCopyTests
