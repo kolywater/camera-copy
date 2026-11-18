@@ -45,6 +45,81 @@ final class IndependentCheckTests: TempDirTestCase {
         XCTAssertNil(IndependentCheck(scriptURL: nil).scriptSHA256)
     }
 
+    // MARK: Progress (display only)
+
+    func testParsesTheScriptsProgressLines() {
+        let a = IndependentCheck.parseProgress("Destination: 1,240 of 3,100 files (41.2 GB of 98.0 GB)")
+        XCTAssertEqual(a?.step, .folder)
+        XCTAssertEqual(a?.fraction ?? 0, 41.2 / 98.0, accuracy: 0.001, "bytes, not file counts")
+        let b = IndependentCheck.parseProgress("Card: 2 of 4 files (500 KB of 1.0 MB)")
+        XCTAssertEqual(b?.step, .card)
+        XCTAssertEqual(b?.fraction ?? 0, 0.5, accuracy: 0.001, "mixed units")
+        XCTAssertEqual(IndependentCheck.parseProgress("Card: 3 of 4 files")?.fraction ?? 0, 0.75, accuracy: 0.001)
+        XCTAssertEqual(IndependentCheck.parseProgress("Destination: 0 of 0 files (0 KB of 0 KB)")?.fraction, 1)
+        XCTAssertNil(IndependentCheck.parseProgress("MISSING: /card/Destination: 1 of 2 files"))
+        XCTAssertNil(IndependentCheck.parseProgress("Card: lots of files"))
+    }
+
+    func testRealScriptShowsProgressWhileRunningAndStillEndsWithItsVerdict() async throws {
+        let card = tmp.appendingPathComponent("Card"), folder = tmp.appendingPathComponent("Folder")
+        for i in 0..<300 {
+            let f = try makeFile("DCIM/100MSDCF/DSC\(i).JPG", size: 2000, in: card)
+            try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+            try FileManager.default.copyItem(at: f, to: folder.appendingPathComponent(f.lastPathComponent))
+        }
+        let c = IndependentCheck(scriptURL: bundledScript)
+        c.run(card: card.path, folder: folder.path)
+        var seen: [IndependentCheck.Progress] = []
+        while c.isRunning {
+            if let p = c.progress, seen.last != p { seen.append(p) }
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        XCTAssertEqual(c.state, .passed)
+        XCTAssertTrue(c.latestLine.hasPrefix("OK: "), "the verdict is still the last line: \(c.latestLine)")
+        XCTAssertFalse(seen.isEmpty, "progress shows while it runs")
+        XCTAssertTrue(c.output.contains("Destination: 0 of 300 files"))
+        XCTAssertTrue(c.output.contains("Card: 300 of 300 files"))
+        XCTAssertEqual(c.progress?.step, .card)
+        XCTAssertEqual(c.progress?.fraction, 1)
+        for step in [IndependentCheck.Progress.Step.folder, .card] {
+            let fractions = seen.filter { $0.step == step }.map(\.fraction)
+            XCTAssertEqual(fractions, fractions.sorted(), "never goes backwards within a step")
+        }
+    }
+
+    /// Aiden's real Sony card: AVF_INFO database files are known extras, but only there.
+    func testSonyAVFInfoFilesAreExtrasOnlyAtTheCardRoot() async throws {
+        let card = tmp.appendingPathComponent("SONY"), folder = tmp.appendingPathComponent("Import")
+        let media = ["DCIM/100MSDCF/DSC00001.ARW", "DCIM/100MSDCF/DSC00001.JPG", "DCIM/100MSDCF/DSC00002.ARW", "PRIVATE/M4ROOT/CLIP/C0001.MP4"]
+        let extras = ["AVF_INFO/AVIN0001.INT", "AVF_INFO/AVIN0001.BNP", "AVF_INFO/AVIN0001.INP", "AVF_INFO/PRV00001.BIN",
+                      "PRIVATE/SONY/SONYCARD.IND", "PRIVATE/AVCHD/BDMV/INDEX.BDM", "PRIVATE/AVCHD/BDMV/MOVIEOBJ.BDM",
+                      "PRIVATE/M4ROOT/MEDIAPRO.XML", "PRIVATE/M4ROOT/STATUS.BIN"]
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        for m in media {
+            let f = try makeFile(m, size: 3000, in: card)
+            try FileManager.default.copyItem(at: f, to: folder.appendingPathComponent(f.lastPathComponent))
+        }
+        for e in extras { try makeFile(e, size: 100, in: card) }
+
+        let ok = IndependentCheck(scriptURL: bundledScript)
+        ok.run(card: card.path, folder: folder.path)
+        try await wait(ok)
+        XCTAssertEqual(ok.state, .passed, ok.output)
+        XCTAssertEqual(ok.extraFiles.count, 9)
+        XCTAssertTrue(ok.latestLine.hasSuffix("apart from the 9 Sony extras above"), ok.latestLine)
+
+        // The same file types anywhere else still fail.
+        for misplaced in ["DCIM/100MSDCF/AVIN0002.INT", "AVF_INFO/SUB/AVIN0003.BNP", "PRIVATE/AVCHD/AVF_INFO/AVIN0004.INP"] {
+            let f = try makeFile(misplaced, size: 100, in: card)
+            let c = IndependentCheck(scriptURL: bundledScript)
+            c.run(card: card.path, folder: folder.path)
+            try await wait(c)
+            XCTAssertEqual(c.state, .missing, misplaced)
+            XCTAssertEqual(c.missingFiles.count, 1, misplaced)
+            try FileManager.default.removeItem(at: f)
+        }
+    }
+
     // MARK: Exit code decides the state
 
     func testPerfectImportPassesAndListsExtrasWithoutFailing() async throws {

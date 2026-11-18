@@ -23,6 +23,10 @@
 # fail the check. Any other file type (e.g. .CR3, .NEF, .WAV) counts as MISSING, so a new kind of
 # file can never pass quietly.
 #
+# Progress: while fingerprinting, it prints a line at most every 2 seconds (and once at the end), e.g.
+#   Destination: 1,240 of 3,100 files (41.2 GB of 98.0 GB)
+# Camera Copy shows these as a progress bar. They never change the result.
+#
 # Read-only: it never writes, moves or deletes anything on the card or in the destination.
 # It keeps its two working lists in a temporary folder and deletes that folder when it ends.
 # It doesn't use Camera Copy's code or its checksums file.
@@ -34,6 +38,8 @@
 #   bdm cpi mpl  AVCHD index files that Sony cameras create even if you never shoot AVCHD
 #   PRIVATE/M4ROOT/THMBNL/*.JPG   Sony's small clip previews: only JPGs, only directly in that folder
 #                                 (anything else in a THMBNL folder still counts as MISSING)
+#   AVF_INFO/*.INT *.BNP *.INP    Sony's card database, only directly in AVF_INFO at the card root
+#                                 (the same types anywhere else still count as MISSING)
 known_extra_types="xml bin ind bdm cpi mpl"
 
 set -u
@@ -57,6 +63,8 @@ is_known_extra() {
   case "$path" in
     /private/m4root/thmbnl/*/*) ;;                     # inside a subfolder of THMBNL: not a preview
     /private/m4root/thmbnl/*.jpg) return 0 ;;          # Sony's clip previews: JPGs directly in that folder
+    /avf_info/*/*) ;;                                  # inside a subfolder of AVF_INFO: not Sony's database
+    /avf_info/*.int|/avf_info/*.bnp|/avf_info/*.inp) return 0 ;;   # Sony's card database at the card root
   esac
   name=${path##*/}
   case "$name" in *.*) ;; *) return 1 ;; esac            # no type at all: not a known extra
@@ -64,7 +72,19 @@ is_known_extra() {
   return 1
 }
 
-# A temporary folder for the two working lists, deleted when the script ends.
+# Progress helpers. The total size of the files in a list, the number of files in it, sizes in words,
+# and the progress line itself (at most every 2 seconds, plus the last one).
+sizes() { xargs -0 stat -f %z < "$1"; }    # one size per line, in the same order as the list
+total_bytes() { awk '{ s += $1 } END { print s + 0 }' "$1"; }
+file_count() { tr -cd '\0' < "$1" | wc -c | tr -d ' '; }
+in_words() { awk -v b="$1" 'BEGIN { if (b >= 1e9) printf "%.1f GB", b / 1e9; else if (b >= 1e6) printf "%.1f MB", b / 1e6; else printf "%.0f KB", b / 1e3 }'; }
+show_progress() {   # label, files done, files in all, bytes done, bytes in all
+  [ "$2" -lt "$3" ] && [ "$SECONDS" -lt $((last_shown + 2)) ] && return
+  last_shown=$SECONDS
+  printf "%s: %'d of %'d files (%s of %s)\n" "$1" "$2" "$3" "$(in_words "$4")" "$(in_words "$5")"
+}
+
+# A temporary folder for the working lists, deleted when the script ends.
 work=$(mktemp -d) || exit 2
 trap 'rm -rf "$work"' EXIT
 
@@ -77,18 +97,32 @@ if ! find "$card" "${skip_dirs[@]}" -o -type f ! \( "${skip_files[@]}" \) -print
   echo "NOT OK: couldn't read every folder on the card ($card)."; exit 1
 fi
 
-# Step 2: fingerprint every file in the destination, keeping just the fingerprints, one per line.
-# (shasum puts a "\" in front of a line when the file name has odd characters; sed removes it.)
+# Step 2: fingerprint every file in the destination, one at a time, keeping just the fingerprints.
+# A destination file that can't be read simply has no fingerprint, so a card file can't match it.
 echo "Fingerprinting the destination (this can take a while)…"
-find "$dest" "${skip_dirs[@]}" -o -type f ! \( "${skip_files[@]}" \) -exec shasum -a 256 {} + \
-  | sed 's/^\\//' | cut -c1-64 | sort -u > "$work/dest-prints"
+find "$dest" "${skip_dirs[@]}" -o -type f ! \( "${skip_files[@]}" \) -print0 > "$work/dest-files"
+sizes "$work/dest-files" > "$work/dest-sizes"
+all=$(file_count "$work/dest-files"); all_bytes=$(total_bytes "$work/dest-sizes"); counted=0; done_bytes=0
+last_shown=-99; show_progress Destination 0 "$all" 0 "$all_bytes"
+: > "$work/dest-prints"
+while IFS= read -r -d '' file && IFS= read -r size <&3; do
+  print=$(shasum -a 256 2>/dev/null < "$file" | cut -c1-64)
+  [ -z "$print" ] || echo "$print" >> "$work/dest-prints"
+  counted=$((counted + 1)); done_bytes=$((done_bytes + ${size:-0}))
+  show_progress Destination "$counted" "$all" "$done_bytes" "$all_bytes"
+done < "$work/dest-files" 3< "$work/dest-sizes"
+sort -u -o "$work/dest-prints" "$work/dest-prints"
 
 # Step 3: go through the card one file at a time, fingerprint it, and look for it in the destination.
 echo "Checking the card…"
 total=0; missing=0; extras=0
 missing_list=(); extras_list=()
-while IFS= read -r -d '' file; do
+sizes "$work/card-files" > "$work/card-sizes"
+all=$(file_count "$work/card-files"); all_bytes=$(total_bytes "$work/card-sizes"); done_bytes=0
+last_shown=-99; show_progress Card 0 "$all" 0 "$all_bytes"
+while IFS= read -r -d '' file && IFS= read -r size <&3; do
   total=$((total + 1))
+  done_bytes=$((done_bytes + ${size:-0}))
   print=$(shasum -a 256 2>/dev/null < "$file" | cut -c1-64)
   if [ -z "$print" ]; then
     missing_list+=("UNREADABLE: $file"); missing=$((missing + 1))   # couldn't read it, so it can't be confirmed
@@ -99,7 +133,8 @@ while IFS= read -r -d '' file; do
   else
     missing_list+=("MISSING: $file"); missing=$((missing + 1))   # no file in the destination has these contents
   fi
-done < "$work/card-files"
+  show_progress Card "$total" "$all" "$done_bytes" "$all_bytes"
+done < "$work/card-files" 3< "$work/card-sizes"
 
 # Step 4: count what the skip rule left out on the card, so nothing is hidden.
 skipped=$(find "$card" "${skip_dirs[@]}" -print -o -type f \( "${skip_files[@]}" \) -print | wc -l | tr -d ' ')

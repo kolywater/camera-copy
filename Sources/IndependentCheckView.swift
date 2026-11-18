@@ -55,9 +55,17 @@ struct IndependentCheckSection: View {
                 }
                 Button("Stop") { check.stop() }.controlSize(.small)
             }
-            // The script's current step, in its own words.
-            Text(check.latestLine.isEmpty ? "Starting verify-card.sh…" : check.latestLine)
-                .font(.caption.monospaced()).foregroundStyle(.secondary).lineLimit(2).truncationMode(.middle)
+            if let progress = check.progress {
+                // The script's own progress line, as a bar and in its own words.
+                ProgressView(value: progress.fraction) {
+                    Text(progress.stepText).font(.caption)
+                }
+                Text(progress.line)
+                    .font(.caption.monospaced()).foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
+            } else {
+                Text(check.latestLine.isEmpty ? "Starting verify-card.sh…" : check.latestLine)
+                    .font(.caption.monospaced()).foregroundStyle(.secondary).lineLimit(2).truncationMode(.middle)
+            }
         }
         .padding(.vertical, 2)
     }

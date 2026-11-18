@@ -63,6 +63,38 @@ final class IndependentCheck {
         lines.last { !$0.trimmingCharacters(in: .whitespaces).isEmpty } ?? ""
     }
 
+    /// Where the running script is, from its newest progress line ("Destination: 1,240 of 3,100 files
+    /// (41.2 GB of 98.0 GB)", then "Card: …"). For the progress bar only; the result never depends on it.
+    struct Progress: Equatable {
+        enum Step: Equatable { case folder, card }
+        var step: Step
+        var fraction: Double
+        var line: String
+
+        var stepText: String { step == .folder ? "Step 1 of 2: reading the folder" : "Step 2 of 2: checking the card" }
+    }
+
+    var progress: Progress? {
+        guard let line = lines.last(where: { $0.hasPrefix("Destination: ") || $0.hasPrefix("Card: ") }) else { return nil }
+        return Self.parseProgress(line)
+    }
+
+    nonisolated static func parseProgress(_ line: String) -> Progress? {
+        let step: Progress.Step
+        if line.hasPrefix("Destination: ") { step = .folder } else if line.hasPrefix("Card: ") { step = .card } else { return nil }
+        let pattern = #"^\w+: ([\d,. ]+) of ([\d,. ]+) files(?: \(([\d.]+) (KB|MB|GB) of ([\d.]+) (KB|MB|GB)\))?$"#
+        guard let m = line.wholeMatch(of: try! Regex(pattern)) else { return nil }
+        func count(_ i: Int) -> Double? { m[i].substring.flatMap { Double($0.filter(\.isNumber)) } }
+        func bytes(_ n: Int, _ unit: Int) -> Double? {
+            guard let v = m[n].substring.flatMap({ Double($0) }), let u = m[unit].substring else { return nil }
+            return v * (u == "GB" ? 1e9 : u == "MB" ? 1e6 : 1e3)
+        }
+        guard let doneFiles = count(1), let allFiles = count(2) else { return nil }
+        var fraction = allFiles > 0 ? doneFiles / allFiles : 1
+        if let done = bytes(3, 4), let all = bytes(5, 6), all > 0 { fraction = done / all }   // bytes track time better
+        return Progress(step: step, fraction: min(1, max(0, fraction)), line: line)
+    }
+
     /// Card files the script reported as MISSING or UNREADABLE (its verdict line is left out).
     var missingFiles: [String] {
         let verdict = latestLine
