@@ -120,6 +120,58 @@ final class IndependentCheckTests: TempDirTestCase {
         }
     }
 
+    /// marlowe v1.4 #1: a `stat` failure on one card file (an I/O error on a failing card) must never
+    /// leave a card file unchecked, so it can never turn a missing file into OK.
+    func testStatFailingOnACardFileNeverSkipsACheck() throws {
+        let bin = tmp.appendingPathComponent("bin")
+        try FileManager.default.createDirectory(at: bin, withIntermediateDirectories: true)
+        let fakeStat = bin.appendingPathComponent("stat")
+        try Data("""
+        #!/bin/sh
+        # Fails only for *FLAKY* files, like an I/O error; the rest go to the real stat.
+        shift 2; rc=0
+        for f in "$@"; do
+          case "$f" in *FLAKY*) echo "stat: $f: Input/output error" >&2; rc=1;; *) /usr/bin/stat -f %z "$f" || rc=1;; esac
+        done
+        exit $rc
+
+        """.utf8).write(to: fakeStat)
+        try shell("/bin/chmod", ["755", fakeStat.path])
+
+        let card = tmp.appendingPathComponent("card"), dest = tmp.appendingPathComponent("dest")
+        try FileManager.default.createDirectory(at: dest, withIntermediateDirectories: true)
+        for f in ["DCIM/100MSDCF/FLAKY_DSC1.ARW", "DCIM/100MSDCF/DSC2.ARW", "PRIVATE/M4ROOT/CLIP/C0002.MP4"] {
+            let src = try makeFile(f, size: 3000, in: card)
+            try FileManager.default.copyItem(at: src, to: dest.appendingPathComponent(src.lastPathComponent))
+        }
+        try makeFile("PRIVATE/M4ROOT/CLIP/C0001.MP4", size: 3000, in: card)     // never copied
+
+        func run() throws -> (code: Int32, output: String) {
+            let p = Process(), pipe = Pipe()
+            p.executableURL = URL(fileURLWithPath: "/bin/bash")
+            p.arguments = ["--noprofile", "--norc", "-p", try XCTUnwrap(bundledScript).path, card.path, dest.path]
+            var env = IndependentCheck.environment
+            env["PATH"] = bin.path + ":" + env["PATH"]!
+            p.environment = env
+            p.standardOutput = pipe; p.standardError = pipe
+            try p.run()
+            let out = String(decoding: pipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+            p.waitUntilExit()
+            return (p.terminationStatus, out)
+        }
+        let missing = try run()
+        XCTAssertEqual(missing.code, 1, missing.output)
+        // (The script prints real paths, /private/var/… for the test's temp folder.)
+        let lastLine = { (out: String) in out.split(separator: "\n").last.map(String.init) ?? "" }
+        XCTAssertTrue(missing.output.contains("/card/PRIVATE/M4ROOT/CLIP/C0001.MP4\n"), missing.output)
+        XCTAssertTrue(lastLine(missing.output).hasPrefix("MISSING: 1 of 4 files on "), "all 4 were checked: \(lastLine(missing.output))")
+
+        try FileManager.default.copyItem(at: card.appendingPathComponent("PRIVATE/M4ROOT/CLIP/C0001.MP4"), to: dest.appendingPathComponent("C0001.MP4"))
+        let ok = try run()
+        XCTAssertEqual(ok.code, 0, ok.output)
+        XCTAssertTrue(lastLine(ok.output).hasPrefix("OK: all 4 files on "), lastLine(ok.output))
+    }
+
     // MARK: Exit code decides the state
 
     func testPerfectImportPassesAndListsExtrasWithoutFailing() async throws {

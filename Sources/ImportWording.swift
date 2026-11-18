@@ -46,7 +46,7 @@ extension AppModel {
     var runHeadline: String {
         switch runStage {
         case .comparing:
-            return runIsCheckOnly ? "Comparing… (nothing will be copied)"
+            return runIsCheckOnly ? "Comparing… (only files that differ will be copied)"
                 : "Checking \(Format.count(runCompareCount)) already in the folder, then copying \(Format.count(runCopyCount))"
         case .copying where runIsCheckOnly:
             return "Copying \(Format.count(differingCount)) that differ, as new names"
@@ -106,6 +106,7 @@ extension AppModel {
         if phase == .importing { return "Card removed during import" }
         if phase == .done {
             let unconfirmed = cardFiles.count - verifiedCount - alreadyThereCount
+            if unconfirmed <= 0 { return "Card removed. All files were confirmed before it stopped." }
             return "Card removed. \(Format.count(unconfirmed)) \(unconfirmed == 1 ? "file wasn't" : "files weren't") confirmed, so keep the card."
         }
         return "Ejected · plug in a card"
@@ -193,6 +194,6 @@ extension AppModel {
     var quitWarning: (title: String, detail: String) {
         runIsCheckOnly && differingCount == 0
             ? ("A check is still running", "Quitting stops the check. Nothing has been copied.")
-            : ("An import is still running", "If you quit now, the folder will be incomplete and nothing on the card will be verified.")
+            : ("An import is still running", "If you quit now, the files copied so far stay verified, but the rest won't be copied. Keep the card.")
     }
 }

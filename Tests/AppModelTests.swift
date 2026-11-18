@@ -695,6 +695,19 @@ final class AppModelTests: TempDirTestCase {
         XCTAssertFalse(m.canFinishRemaining, "finishing needs the card back")
     }
 
+    /// marlowe v1.4 #3: never "0 files weren't confirmed, so keep the card".
+    func testCardRemovedAfterEverythingWasConfirmed() async throws {
+        try makeCard()
+        let m = try await readyModel()
+        m.folderName = "Shoot"
+        m.startImport()
+        try await wait(m, for: .done)
+        XCTAssertTrue(m.allVerified)
+        m.sourceEjected = true
+        XCTAssertEqual(m.ejectedDetail, "Ejected · safe to remove")
+        XCTAssertTrue(m.quitWarning.detail.contains("copied so far stay verified"), "the import quit warning doesn't overstate it")
+    }
+
     /// #40: Eject waits when the independent check found missing files.
     func testEjectIsHeldBackByARedIndependentCheck() async throws {
         try makeCard()
@@ -814,7 +827,7 @@ final class AppModelTests: TempDirTestCase {
         while m.phase != .importing && Date() < deadline { try await Task.sleep(for: .milliseconds(5)) }
         XCTAssertEqual(m.runSectionTitle, "Checking")
         XCTAssertEqual(m.cancelTitle, "Stop Checking")
-        XCTAssertEqual(m.runHeadline, "Comparing… (nothing will be copied)")
+        XCTAssertEqual(m.runHeadline, "Comparing… (only files that differ will be copied)")
         XCTAssertEqual(m.quitWarning.title, "A check is still running")
         try await wait(m, for: .done)
 

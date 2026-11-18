@@ -74,8 +74,7 @@ is_known_extra() {
 
 # Progress helpers. The total size of the files in a list, the number of files in it, sizes in words,
 # and the progress line itself (at most every 2 seconds, plus the last one).
-sizes() { xargs -0 stat -f %z < "$1"; }    # one size per line, in the same order as the list
-total_bytes() { awk '{ s += $1 } END { print s + 0 }' "$1"; }
+total_bytes() { xargs -0 stat -f %z < "$1" | awk '{ s += $1 } END { print s + 0 }'; }   # for the progress line only
 file_count() { tr -cd '\0' < "$1" | wc -c | tr -d ' '; }
 in_words() { awk -v b="$1" 'BEGIN { if (b >= 1e9) printf "%.1f GB", b / 1e9; else if (b >= 1e6) printf "%.1f MB", b / 1e6; else printf "%.0f KB", b / 1e3 }'; }
 show_progress() {   # label, files done, files in all, bytes done, bytes in all
@@ -101,28 +100,28 @@ fi
 # A destination file that can't be read simply has no fingerprint, so a card file can't match it.
 echo "Fingerprinting the destination (this can take a while)…"
 find "$dest" "${skip_dirs[@]}" -o -type f ! \( "${skip_files[@]}" \) -print0 > "$work/dest-files"
-sizes "$work/dest-files" > "$work/dest-sizes"
-all=$(file_count "$work/dest-files"); all_bytes=$(total_bytes "$work/dest-sizes"); counted=0; done_bytes=0
+all=$(file_count "$work/dest-files"); all_bytes=$(total_bytes "$work/dest-files"); counted=0; done_bytes=0
 last_shown=-99; show_progress Destination 0 "$all" 0 "$all_bytes"
 : > "$work/dest-prints"
-while IFS= read -r -d '' file && IFS= read -r size <&3; do
+while IFS= read -r -d '' file; do
   print=$(shasum -a 256 2>/dev/null < "$file" | cut -c1-64)
   [ -z "$print" ] || echo "$print" >> "$work/dest-prints"
-  counted=$((counted + 1)); done_bytes=$((done_bytes + ${size:-0}))
+  size=$(stat -f %z "$file" 2>/dev/null) || size=0           # only for the progress line
+  counted=$((counted + 1)); done_bytes=$((done_bytes + size))
   show_progress Destination "$counted" "$all" "$done_bytes" "$all_bytes"
-done < "$work/dest-files" 3< "$work/dest-sizes"
+done < "$work/dest-files"
 sort -u -o "$work/dest-prints" "$work/dest-prints"
 
 # Step 3: go through the card one file at a time, fingerprint it, and look for it in the destination.
 echo "Checking the card…"
 total=0; missing=0; extras=0
 missing_list=(); extras_list=()
-sizes "$work/card-files" > "$work/card-sizes"
-all=$(file_count "$work/card-files"); all_bytes=$(total_bytes "$work/card-sizes"); done_bytes=0
+all=$(file_count "$work/card-files"); all_bytes=$(total_bytes "$work/card-files"); done_bytes=0
 last_shown=-99; show_progress Card 0 "$all" 0 "$all_bytes"
-while IFS= read -r -d '' file && IFS= read -r size <&3; do
+while IFS= read -r -d '' file; do
   total=$((total + 1))
-  done_bytes=$((done_bytes + ${size:-0}))
+  size=$(stat -f %z "$file" 2>/dev/null) || size=0           # only for the progress line
+  done_bytes=$((done_bytes + size))
   print=$(shasum -a 256 2>/dev/null < "$file" | cut -c1-64)
   if [ -z "$print" ]; then
     missing_list+=("UNREADABLE: $file"); missing=$((missing + 1))   # couldn't read it, so it can't be confirmed
@@ -134,7 +133,10 @@ while IFS= read -r -d '' file && IFS= read -r size <&3; do
     missing_list+=("MISSING: $file"); missing=$((missing + 1))   # no file in the destination has these contents
   fi
   show_progress Card "$total" "$all" "$done_bytes" "$all_bytes"
-done < "$work/card-files" 3< "$work/card-sizes"
+done < "$work/card-files"
+
+# Every card file on the list must have been checked; otherwise the result can't be trusted.
+[ "$total" -eq "$all" ] || { echo "NOT OK: only $total of $all card files could be checked."; exit 1; }
 
 # Step 4: count what the skip rule left out on the card, so nothing is hidden.
 skipped=$(find "$card" "${skip_dirs[@]}" -print -o -type f \( "${skip_files[@]}" \) -print | wc -l | tr -d ' ')
