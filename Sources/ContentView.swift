@@ -35,15 +35,6 @@ struct ContentView: View {
             // Quiet check on launch: only speaks up if there is an update.
             await updater.check(userInitiated: false)
         }
-        #if UPDATE_SELFTEST
-        // Test builds only: do what a click on "Install and Relaunch" does, then close the alert as SwiftUI does.
-        .task(id: updater.latest?.version) {
-            guard updater.latest != nil else { return }
-            try? await Task.sleep(for: .seconds(2))
-            updater.installButtonClicked()
-            updater.showUpdateAlert = false
-        }
-        #endif
         .onReceive(NotificationCenter.default.publisher(for: .checkForUpdatesRequested)) { _ in
             Task { await updater.check(userInitiated: true) }
         }
@@ -250,7 +241,7 @@ struct Sidebar: View {
             return "Import \(Format.count(model.cardFiles.count)) Files"
         }
         let n = model.filesToCopyCount
-        if n == 0 { return "Nothing New to Import" }
+        if n == 0 { return "Confirm \(Format.count(model.alreadyThere.count)) Matching Files" }
         return "Import \(Format.count(n)) New \(n == 1 ? "File" : "Files")"
     }
 
@@ -283,9 +274,10 @@ struct ExistingFolderNote: View {
                 let new = model.filesToCopyCount
                 HStack(alignment: .firstTextBaseline, spacing: 6) {
                     Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
-                    Text(there == model.cardFiles.count
-                         ? "The folder already has all \(Format.count(there)) files."
-                         : "\(Format.count(new)) to copy, \(Format.count(there)) already there.")
+                    Text((there == model.cardFiles.count
+                      ? "The folder has all \(Format.count(there)) files by name and size."
+                      : "\(Format.count(new)) to copy, \(Format.count(there)) with the same name and size.")
+                     + " Importing compares those by checksum; any that differ are copied with a new name.")
                 }
             }
         }

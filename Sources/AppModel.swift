@@ -70,6 +70,17 @@ final class AppModel {
     /// How many files the running import (or retry) copies.
     var runCount = 0
 
+    /// Copies and verifies one file; tests swap in a faulty one to check how bad copies are reported.
+    typealias Copier = @Sendable (_ from: URL, _ to: URL, _ size: Int64, _ modified: Date, _ mayReplace: Bool,
+                                  _ cancel: CancelToken, _ progress: (Int64) -> Void) throws -> Importer.CopyResult
+    @ObservationIgnored var copier: Copier = {
+        try Importer.copyAndVerify(from: $0, to: $1, expectedSize: $2, modified: $3, mayReplace: $4, cancel: $5, progress: $6)
+    }
+    /// Fingerprints one file (used to confirm "already there" in an existing folder).
+    @ObservationIgnored var hasher: @Sendable (URL, CancelToken, (Int64) -> Void) throws -> String = {
+        try Importer.hashFile($0, cancel: $1, progress: $2)
+    }
+
     @ObservationIgnored private var cancelToken: CancelToken?
     /// Keeps the Mac from idle-sleeping in the middle of a long import.
     @ObservationIgnored private var sleepActivity: NSObjectProtocol?
@@ -131,7 +142,8 @@ final class AppModel {
         guard (phase == .ready || phase == .done) && !sourceEjected && !cardFiles.isEmpty else { return false }
         switch destinationMode {
         case .newFolder: return folderNameError == nil
-        case .existingFolder: return existingFolderError == nil && filesToCopyCount > 0
+        // Even with nothing new, importing confirms by checksum that the matching files really are the same.
+        case .existingFolder: return existingFolderError == nil
         }
     }
 
@@ -464,11 +476,9 @@ final class AppModel {
             alertMessage = existingFolderError ?? "Choose a folder to add to."
             return
         }
+        // Same name and size is only a candidate: run() compares checksums before calling it "already there".
         let toCopy = cardFiles.filter { alreadyThere[$0.id] == nil }
-        guard !toCopy.isEmpty else {
-            alertMessage = "Everything on the card is already in “\(dest.lastPathComponent)”."
-            return
-        }
+        let candidates = cardFiles.compactMap { f in alreadyThere[f.id].map { (card: f, folder: $0) } }
 
         let needed = toCopy.reduce(0) { $0 + $1.size }
         if let free = try? dest.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey])
@@ -479,11 +489,11 @@ final class AppModel {
         }
 
         resetResults()
-        for f in cardFiles { statuses[f.id] = alreadyThere[f.id] != nil ? .alreadyThere : .pending }
+        for f in cardFiles { statuses[f.id] = .pending }
         destinationURL = dest
         preexistingNames = listing.takenNames
         manifestFileName = Importer.newManifestName(taken: listing.takenNames)
-        run(toCopy, into: dest)
+        run(toCopy, into: dest, confirming: candidates)
     }
 
     var canRetry: Bool {
@@ -495,14 +505,20 @@ final class AppModel {
         guard canRetry, let dest = destinationURL else { return }
         let failed = cardFiles.filter(isProblem)
         for f in failed { statuses[f.id] = .pending }
-        run(failed, into: dest)
+        // A file that was only a same-name-and-size candidate is compared again, never copied over.
+        let candidates = failed.compactMap { f in alreadyThere[f.id].map { (card: f, folder: $0) } }
+        run(failed.filter { alreadyThere[$0.id] == nil }, into: dest, confirming: candidates)
     }
 
-    private func run(_ files: [CardFile], into dest: URL) {
+    /// Copies `files` into `dest`. First, each of `candidates` (a card file and a folder file with the
+    /// same name and size) is compared by SHA-256: the same contents count as already there; different
+    /// contents are copied under a new, free name, and the folder's own file is left alone.
+    private func run(_ files: [CardFile], into dest: URL, confirming candidates: [(card: CardFile, folder: DestFile)] = []) {
         independentCheck.reset()       // its result belonged to the folder as it was before this import
         bytesDone = 0
         bytesTotal = files.reduce(0) { $0 + $1.size } * 3   // copy + read back the copy + re-read the card
-        runCount = files.count
+            + candidates.reduce(0) { $0 + $1.card.size } * 2  // read the card file + read the folder file
+        runCount = files.count + candidates.count
         timeLeftText = "Estimating…"
         currentIndex = 0
         wasCancelled = false
@@ -513,6 +529,7 @@ final class AppModel {
         cancelToken = token
         let preexisting = preexistingNames
         let manifestName = manifestFileName
+        let copier = self.copier, hasher = self.hasher
         sleepActivity = ProcessInfo.processInfo.beginActivity(
             options: [.userInitiated, .idleSystemSleepDisabled], reason: "Copying photos and videos")
 
@@ -531,10 +548,56 @@ final class AppModel {
         }
 
         Task.detached(priority: .userInitiated) {
-            for (index, file) in files.enumerated() {
+            // 1. Compare each same-name-and-size candidate with the folder's file, by checksum.
+            var different: [CardFile] = []
+            for (index, c) in candidates.enumerated() {
                 if token.isCancelled { break }
                 await MainActor.run {
                     self.currentIndex = index + 1
+                    self.currentFileName = c.card.name
+                    self.statuses[c.card.id] = .copying
+                }
+                let status: VerifyStatus
+                do {
+                    let progress: (Int64) -> Void = { n in Task { @MainActor in self.bytesDone += n } }
+                    let onCard = try hasher(c.card.url, token, progress)
+                    let inFolder = try hasher(c.folder.url, token, progress)
+                    if onCard == inFolder {
+                        status = .alreadyThere
+                    } else {
+                        different.append(c.card)
+                        status = .pending
+                    }
+                } catch is CancellationError {
+                    status = .failed("Cancelled")
+                } catch {
+                    status = .failed("Couldn't compare with \(c.folder.name): \(error.localizedDescription)")
+                }
+                await MainActor.run { self.statuses[c.card.id] = status }
+            }
+            // Different photos that only share a name and size get a new name and are copied.
+            let differing = different
+            let renamed: [CardFile] = await MainActor.run {
+                var taken = preexisting.union(self.cardFiles.map { $0.destName.lowercased() })
+                return differing.map { card in
+                    let name = ExistingFolder.freeName(card.destName, taken: taken)
+                    taken.insert(name.lowercased())
+                    self.alreadyThere[card.id] = nil
+                    self.bytesTotal += card.size * 3
+                    if let i = self.cardFiles.firstIndex(where: { $0.id == card.id }) { self.cardFiles[i].destName = name }
+                    var updated = card
+                    updated.destName = name
+                    return updated
+                }
+            }
+            let toCopy = files + renamed
+            let offset = candidates.count
+
+            // 2. Copy and verify.
+            for (index, file) in toCopy.enumerated() {
+                if token.isCancelled { break }
+                await MainActor.run {
+                    self.currentIndex = offset + index + 1
                     self.currentFileName = file.name
                     self.statuses[file.id] = .copying
                 }
@@ -542,10 +605,8 @@ final class AppModel {
                 let target = dest.appendingPathComponent(file.destName)
                 let status: VerifyStatus
                 do {
-                    let r = try Importer.copyAndVerify(from: file.url, to: target, expectedSize: file.size,
-                                                       modified: file.modified,
-                                                       mayReplace: !preexisting.contains(file.destName.lowercased()),
-                                                       cancel: token) { n in
+                    let r = try copier(file.url, target, file.size, file.modified,
+                                       !preexisting.contains(file.destName.lowercased()), token) { n in
                         Task { @MainActor in self.bytesDone += n }
                     }
                     if r.allMatch {

@@ -70,6 +70,24 @@ final class ImporterTests: TempDirTestCase {
         XCTAssertEqual(try Data(contentsOf: existing), before, "the folder's own file must be untouched")
     }
 
+    /// A file that appears in the folder while the copy runs is never replaced: the final move refuses.
+    func testFileAppearingDuringTheCopyIsNotReplaced() throws {
+        let src = try makeFile("card/DSC1.JPG", size: 50_000)
+        let out = tmp.appendingPathComponent("out")
+        try FileManager.default.createDirectory(at: out, withIntermediateDirectories: true)
+        let dst = out.appendingPathComponent("DSC1.JPG")
+        var appeared = false
+        XCTAssertThrowsError(try Importer.copyAndVerify(from: src, to: dst, expectedSize: 50_000, modified: day(1),
+                                                        mayReplace: false, cancel: CancelToken()) { _ in
+            if !appeared { appeared = true; try? Data("someone else's".utf8).write(to: dst) }
+        })
+        XCTAssertTrue(appeared)
+        XCTAssertEqual(try String(contentsOf: dst, encoding: .utf8), "someone else's", "the other file is untouched")
+        XCTAssertEqual(try names(in: out), ["DSC1.JPG"])
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: out.path).filter { $0.hasSuffix(".partial") }, [],
+                       "no .partial file is left behind")
+    }
+
     func testRetryReplacesItsOwnBadCopyWhenAllowed() throws {
         let src = try makeFile("card/DSC1.JPG")
         let bad = try makeFile("out/DSC1.JPG", size: 10)

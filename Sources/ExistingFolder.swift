@@ -34,7 +34,9 @@ enum ExistingFolder {
         return Listing(files: files, takenNames: taken)
     }
 
-    /// "Already there" means a file in the folder with the same name (ignoring case) and the same size.
+    /// A candidate for "already there" is a file in the folder with the same name (ignoring case) and
+    /// the same size. It is only a candidate: the import compares checksums before trusting it
+    /// (Sony RAWs from one camera are all the same size).
     ///
     /// The card scanner renames clashing names with a "-2", "-3"… suffix (and renames a RAW+JPEG pair
     /// together), so an earlier import of this card may hold "DSC00001-2.ARW". A card file also counts as
@@ -108,6 +110,13 @@ enum ExistingFolder {
     private static func groupKey(_ f: CardFile) -> String {
         ((f.relativePath as NSString).deletingLastPathComponent + "/"
             + (f.name as NSString).deletingPathExtension).lowercased()
+    }
+
+    /// The first "-2", "-3"… version of `name` that nobody uses.
+    static func freeName(_ name: String, taken: Set<String>) -> String {
+        var n = 2
+        while taken.contains(suffixedName(name, n).lowercased()) { n += 1 }
+        return suffixedName(name, n)
     }
 
     static func suffixedName(_ name: String, _ n: Int) -> String {

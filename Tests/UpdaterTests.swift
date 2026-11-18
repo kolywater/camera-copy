@@ -31,10 +31,14 @@ final class UpdaterTests: TempDirTestCase {
     }
 
     /// A zip like the release asset: CameraCopy.app inside, optionally quarantined.
-    func makeReleaseZip(appName: String = "CameraCopy.app", quarantined: Bool = false) throws -> URL {
+    func makeReleaseZip(appName: String = "CameraCopy.app", version: String = "1.1", quarantined: Bool = false) throws -> URL {
         let src = tmp.appendingPathComponent("build-\(UUID().uuidString)")
         let app = try makeFile("\(appName)/Contents/MacOS/CameraCopy", size: 100, in: src).deletingLastPathComponent()
             .deletingLastPathComponent().deletingLastPathComponent()
+        let plist: [String: Any] = ["CFBundleShortVersionString": version, "CFBundleIdentifier": "com.aiden.CameraCopy",
+                                    "CFBundleExecutable": "CameraCopy", "CFBundlePackageType": "APPL"]
+        try PropertyListSerialization.data(fromPropertyList: plist, format: .xml, options: 0)
+            .write(to: app.appendingPathComponent("Contents/Info.plist"))
         if quarantined {
             try shell("/usr/bin/xattr", ["-w", "com.apple.quarantine", "0083;00000000;Safari;", app.appendingPathComponent("Contents/MacOS/CameraCopy").path])
         }
@@ -46,7 +50,7 @@ final class UpdaterTests: TempDirTestCase {
     /// An environment where everything succeeds unless a test changes it.
     func makeEnv(zip: URL? = nil, newSigner: (team: String?, bundleID: String?)? = ("TEAM1", "com.aiden.CameraCopy"),
                  mySigner: (team: String?, bundleID: String?)? = ("TEAM1", "com.aiden.CameraCopy"),
-                 json: Data? = nil) throws -> Updater.Environment {
+                 developerID: Bool = true, json: Data? = nil) throws -> Updater.Environment {
         let zip = try zip ?? makeReleaseZip()
         let running = runningApp
         var env = Updater.Environment()
@@ -58,6 +62,10 @@ final class UpdaterTests: TempDirTestCase {
             return (copy, self.http(200, url))
         }
         env.signingIdentity = { url, _ in url.standardizedFileURL == running.standardizedFileURL ? mySigner : newSigner }
+        env.satisfies = { _, requirement in
+            XCTAssertTrue(requirement.contains("anchor apple generic") && requirement.contains("\"TEAM1\""))
+            return developerID
+        }
         env.launchHelper = { [unowned self] in self.helperScripts.append($0) }
         env.quit = { [unowned self] in self.quitCount += 1 }
         env.tempDirectory = tmp
@@ -222,11 +230,34 @@ final class UpdaterTests: TempDirTestCase {
     }
 
     func testOtherTeamIsRefused() async throws {
-        await assertInstallFails(try makeEnv(newSigner: ("OTHER", "com.aiden.CameraCopy")), containing: "someone else")
+        await assertInstallFails(try makeEnv(newSigner: ("OTHER", "com.aiden.CameraCopy")), containing: "Developer ID certificate")
     }
 
     func testOtherBundleIDIsRefused() async throws {
-        await assertInstallFails(try makeEnv(newSigner: ("TEAM1", "com.example.Other")), containing: "someone else")
+        await assertInstallFails(try makeEnv(newSigner: ("TEAM1", "com.example.Other")), containing: "Developer ID certificate")
+    }
+
+    /// Right team ID and bundle ID in the signature, but not an Apple-issued Developer ID certificate.
+    func testClaimedTeamWithoutDeveloperIDCertificateIsRefused() async throws {
+        await assertInstallFails(try makeEnv(developerID: false), containing: "Developer ID certificate")
+    }
+
+    func testMislabelledOrOlderBuildIsRefused() async throws {
+        await assertInstallFails(try makeEnv(zip: makeReleaseZip(version: "1.0")), containing: "version 1.0, not v1.1")
+        let u = makeUpdater(try makeEnv(), version: "1.2")             // a "newer" tag holding an older app
+        XCTAssertThrowsError(try u.prepare(try makeReleaseZip(version: "1.1"), expectedVersion: "v1.1")) {
+            XCTAssertTrue($0.localizedDescription.contains("version 1.1"))
+        }
+    }
+
+    func testAppThatIsASymlinkIsRefused() async throws {
+        let src = tmp.appendingPathComponent("evil")
+        try FileManager.default.createDirectory(at: src, withIntermediateDirectories: true)
+        try FileManager.default.createSymbolicLink(atPath: src.appendingPathComponent("CameraCopy.app").path,
+                                                   withDestinationPath: "/System/Applications/Calculator.app")
+        let zip = tmp.appendingPathComponent("evil.zip")
+        XCTAssertEqual(try shell("/usr/bin/ditto", ["-c", "-k", src.path, zip.path]), 0)
+        await assertInstallFails(try makeEnv(zip: zip), containing: "didn't contain the app")
     }
 
     func testUnsignedRunningAppIsRefused() async throws {
@@ -267,7 +298,7 @@ final class UpdaterTests: TempDirTestCase {
         XCTAssertTrue(try quarantined(check.appendingPathComponent("CameraCopy.app")))
 
         let u = makeUpdater(try makeEnv(zip: zip))
-        let newApp = try u.prepare(zip)
+        let newApp = try u.prepare(zip, expectedVersion: "v1.1")
         XCTAssertEqual(newApp.lastPathComponent, "CameraCopy.app")
         XCTAssertFalse(try quarantined(newApp))
         XCTAssertFalse(FileManager.default.fileExists(atPath: zip.path), "the download is cleaned up")
@@ -291,7 +322,20 @@ final class UpdaterTests: TempDirTestCase {
         let u = Updater(currentVersion: "1.0", appURL: me)          // real Environment
         let copy = tmp.appendingPathComponent("Copy.xctest")
         try FileManager.default.copyItem(at: me, to: copy)
-        XCTAssertNoThrow(try u.verifySameSigner(copy), "an untouched copy is the same signer")
+        XCTAssertThrowsError(try u.verifySameSigner(copy), "a development-signed build isn't a Developer ID release") {
+            XCTAssertTrue($0.localizedDescription.contains("Developer ID certificate"))
+        }
+
+        // The forgery from marlowe's review: ad-hoc signed, but claiming Aiden's team and the same identifier.
+        let forged = tmp.appendingPathComponent("Forged.xctest")
+        try FileManager.default.copyItem(at: me, to: forged)
+        XCTAssertEqual(try shell("/usr/bin/codesign", ["-f", "-s", "-", "--team-identifier", mine.team!,
+                                                        "-i", mine.bundleID!, forged.path]), 0)
+        let claimed = try XCTUnwrap(Updater.signingIdentity(of: forged, checkValidity: true))
+        XCTAssertEqual(claimed.team, mine.team, "the forged signature really does claim the team")
+        XCTAssertThrowsError(try u.verifySameSigner(forged)) {
+            XCTAssertTrue($0.localizedDescription.contains("Developer ID certificate"))
+        }
 
         let tampered = tmp.appendingPathComponent("Tampered.xctest")
         try FileManager.default.copyItem(at: me, to: tampered)
@@ -301,12 +345,28 @@ final class UpdaterTests: TempDirTestCase {
         let adHoc = tmp.appendingPathComponent("AdHoc.xctest")
         try FileManager.default.copyItem(at: me, to: adHoc)
         XCTAssertEqual(try shell("/usr/bin/codesign", ["-f", "-s", "-", "--deep", adHoc.path]), 0)
-        XCTAssertThrowsError(try u.verifySameSigner(adHoc)) { XCTAssertTrue($0.localizedDescription.contains("someone else")) }
+        XCTAssertThrowsError(try u.verifySameSigner(adHoc)) { XCTAssertTrue($0.localizedDescription.contains("Developer ID certificate")) }
 
         let unsigned = tmp.appendingPathComponent("Unsigned.app")
         try FileManager.default.createDirectory(at: unsigned, withIntermediateDirectories: true)
         XCTAssertNil(Updater.signingIdentity(of: unsigned, checkValidity: true))
         XCTAssertThrowsError(try Updater(currentVersion: "1.0", appURL: unsigned).verifySameSigner(copy))
+    }
+
+    /// A copy signed with Aiden's real Developer ID certificate passes the Apple-anchored check.
+    func testGenuineDeveloperIDBuildIsAccepted() throws {
+        let me = Bundle(for: UpdaterTests.self).bundleURL
+        let mine = try XCTUnwrap(Updater.signingIdentity(of: me))
+        let signed = tmp.appendingPathComponent("DeveloperID.xctest")
+        try FileManager.default.copyItem(at: me, to: signed)
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/codesign")
+        p.arguments = ["-f", "-s", "Developer ID Application: Aiden Elliott (\(mine.team!))", "--timestamp=none", signed.path]
+        p.standardError = Pipe()
+        try p.run(); p.waitUntilExit()
+        try XCTSkipIf(p.terminationStatus != 0, "no Developer ID certificate in this keychain")
+        XCTAssertTrue(Updater.satisfies(signed, requirement: Updater.developerIDRequirement(team: mine.team!, bundleID: mine.bundleID!)))
+        XCTAssertNoThrow(try Updater(currentVersion: "1.0", appURL: me).verifySameSigner(signed))
     }
 
     // MARK: The swap helper, run for real with /bin/sh
@@ -316,7 +376,9 @@ final class UpdaterTests: TempDirTestCase {
         let relaunched = tmp.appendingPathComponent("relaunched"), alerted = tmp.appendingPathComponent("alerted")
         var env = Updater.Environment()
         env.relaunchCommand = "/usr/bin/touch \(Updater.shellQuote(relaunched.path)); /usr/bin/true"
-        env.failureAlertCommand = "/usr/bin/touch \(Updater.shellQuote(alerted.path))"
+        env.failureAlertCommand = { message in
+            "/usr/bin/printf '%s' \(Updater.shellQuote(message)) > \(Updater.shellQuote(alerted.path))"
+        }
         let script = Updater(currentVersion: "1.0", appURL: current, env: env).helperScript(newApp: new, afterPID: pid)
         let status = try shell("/bin/sh", ["-c", script])
         let fm = FileManager.default
@@ -353,6 +415,7 @@ final class UpdaterTests: TempDirTestCase {
         let r = try runHelper(current: current, new: tmp.appendingPathComponent("missing/CameraCopy.app"), waitFor: 999_999)
         XCTAssertEqual(marker(current), "old", "the old app is put back")
         XCTAssertTrue(r.alerted, "a failed swap shows an alert")
+        XCTAssertTrue(try String(contentsOf: tmp.appendingPathComponent("alerted"), encoding: .utf8).contains("previous version was kept"))
         XCTAssertTrue(r.relaunched, "the old app is reopened")
         XCTAssertEqual(try names(in: current.deletingLastPathComponent()), ["CameraCopy.app"])
     }
@@ -365,6 +428,19 @@ final class UpdaterTests: TempDirTestCase {
         XCTAssertEqual(r.status, 1)
         XCTAssertEqual(marker(current), "old")
         XCTAssertTrue(r.alerted)
+        XCTAssertTrue(try String(contentsOf: tmp.appendingPathComponent("alerted"), encoding: .utf8).contains("Open Camera Copy again"))
         XCTAssertFalse(r.relaunched)
+    }
+
+    /// If the old app can't be put back either, the alert says where it is instead of "kept".
+    func testHelperNamesTheOldAppIfItCantBePutBack() {
+        var env = Updater.Environment()
+        env.failureAlertCommand = { "ALERT<\($0)>" }
+        let script = Updater(currentVersion: "1.0", appURL: URL(fileURLWithPath: "/Applications/CameraCopy.app"), env: env)
+            .helperScript(newApp: URL(fileURLWithPath: "/tmp/new/CameraCopy.app"), afterPID: 1)
+        let lostBranch = script.components(separatedBy: "else\n").last ?? ""
+        XCTAssertTrue(lostBranch.contains("couldn’t be put back. It is at /Applications/CameraCopy.app.old-"), script)
+        XCTAssertTrue(lostBranch.contains("exit 1"), "and it doesn't try to open an app that isn't there")
+        XCTAssertTrue(script.contains("elif /bin/mv"), "putting the old app back is itself checked")
     }
 }

@@ -140,7 +140,90 @@ final class AppModelTests: TempDirTestCase {
         m.existingFolderPath = full.path
         m.destinationMode = .newFolder; m.destinationMode = .existingFolder
         XCTAssertEqual(m.filesToCopyCount, 0)
-        XCTAssertFalse(m.canImport, "nothing new to import")
+        XCTAssertTrue(m.canImport, "importing still confirms the matches by checksum")
+        m.startImport()
+        try await wait(m, for: .done)
+        XCTAssertTrue(m.allVerified)
+        XCTAssertEqual(m.verifiedCount, 0)
+        XCTAssertEqual(m.alreadyThereCount, 5)
+    }
+
+    /// marlowe #2: Sony RAWs are all the same size, so the same name and size can still be a different photo.
+    func testSameNameAndSizeButDifferentPhotoIsCopiedWithANewName() async throws {
+        try makeCard()
+        let shoot = out.appendingPathComponent("Shoot")
+        let other = try makeFile("DSC00001.ARW", size: 5000, in: shoot)     // same name and size, different bytes
+        let theirs = try Data(contentsOf: other)
+        let m = try await readyModel()
+        m.existingFolderPath = shoot.path
+        m.destinationMode = .existingFolder
+        let card = try XCTUnwrap(m.cardFiles.first { $0.relativePath == "DCIM/100MSDCF/DSC00001.ARW" })
+        XCTAssertNotNil(m.alreadyThere[card.id], "by name and size alone it looks the same")
+
+        m.startImport()
+        try await wait(m, for: .done)
+        XCTAssertTrue(m.allVerified, "\(m.statuses)")
+        XCTAssertEqual(m.alreadyThereCount, 0, "the checksum shows it's a different photo")
+        let copied = try XCTUnwrap(m.destFiles[card.id])
+        XCTAssertNotEqual(copied.name, "DSC00001.ARW")
+        XCTAssertEqual(try Data(contentsOf: copied.url), try Data(contentsOf: card.url), "the card's photo was copied")
+        XCTAssertEqual(try Data(contentsOf: other), theirs, "the folder's own photo is untouched")
+    }
+
+    func testAComparisonThatFailsCanBeRetried() async throws {
+        try makeCard()
+        let shoot = out.appendingPathComponent("Shoot")
+        try FileManager.default.createDirectory(at: shoot, withIntermediateDirectories: true)
+        let cardClip = card.appendingPathComponent("PRIVATE/M4ROOT/CLIP/C0001.MP4")
+        try FileManager.default.copyItem(at: cardClip, to: shoot.appendingPathComponent("C0001.MP4"))
+        let m = try await readyModel()
+        m.existingFolderPath = shoot.path
+        m.destinationMode = .existingFolder
+        try shell("/bin/chmod", ["000", cardClip.path])
+        m.startImport()
+        try await wait(m, for: .done)
+        XCTAssertEqual(m.problemCount, 1)
+        let clip = try XCTUnwrap(m.cardFiles.first { $0.name == "C0001.MP4" })
+        guard case .failed(let reason) = m.statuses[clip.id] else { return XCTFail("\(String(describing: m.statuses[clip.id]))") }
+        XCTAssertTrue(reason.contains("Couldn't compare"))
+        try shell("/bin/chmod", ["644", cardClip.path])
+        m.retryFailed()
+        try await wait(m, for: .done)
+        XCTAssertTrue(m.allVerified)
+        XCTAssertEqual(m.statuses[clip.id], .alreadyThere, "compared again, not copied over the folder's file")
+        XCTAssertEqual(try names(in: shoot).filter { $0.hasPrefix("C0001") }, ["C0001.MP4"])
+    }
+
+    /// marlowe #3c: what the user sees when the card or the copy gives different data.
+    func testBadReadsAreReportedAsFailures() async throws {
+        try makeCard()
+        let m = try await readyModel()
+        // Copies for real, then reports what a flaky card or a corrupted copy would produce.
+        m.copier = { from, to, size, modified, mayReplace, cancel, progress in
+            let r = try Importer.copyAndVerify(from: from, to: to, expectedSize: size, modified: modified,
+                                               mayReplace: mayReplace, cancel: cancel, progress: progress)
+            if from.path.hasSuffix("CLIP/C0001.MP4") {
+                return .init(sourceHash: r.sourceHash, sourceRereadHash: "different", destHash: r.destHash)
+            }
+            if from.path.hasSuffix("100MSDCF/DSC00001.JPG") {
+                return .init(sourceHash: r.sourceHash, sourceRereadHash: r.sourceHash, destHash: "corrupt")
+            }
+            return r
+        }
+        m.folderName = "Shoot"
+        m.startImport()
+        try await wait(m, for: .done)
+        XCTAssertFalse(m.allVerified)
+        XCTAssertEqual(m.problemCount, 2)
+        let reasons = m.cardFiles.compactMap { f -> String? in
+            if case .failed(let r) = m.statuses[f.id] { return "\(f.relativePath): \(r)" } else { return nil }
+        }.sorted()
+        XCTAssertEqual(reasons.count, 2)
+        XCTAssertTrue(reasons.contains { $0.hasPrefix("DCIM/100MSDCF/DSC00001.JPG") && $0.contains("the copy differs from the card") }, "\(reasons)")
+        XCTAssertTrue(reasons.contains { $0.hasPrefix("PRIVATE/M4ROOT/CLIP/C0001.MP4") && $0.contains("different data on two reads") }, "\(reasons)")
+        let manifest = try String(contentsOf: out.appendingPathComponent("Shoot/checksums.sha256"), encoding: .utf8)
+        XCTAssertFalse(manifest.contains("C0001.MP4"), "failed files never go in the checksums file")
+        XCTAssertEqual(manifest.split(separator: "\n").count, 3)
     }
 
     func testSwitchingBackToNewFolderRestoresTheScannerNames() async throws {

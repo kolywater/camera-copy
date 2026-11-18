@@ -47,6 +47,8 @@ final class Updater {
         var download: (URL) async throws -> (URL, URLResponse) = { try await URLSession.shared.download(from: $0) }
         /// (team ID, bundle ID) of a signed app; with `true`, nil unless the signature is fully valid.
         var signingIdentity: (URL, Bool) -> (team: String?, bundleID: String?)? = { Updater.signingIdentity(of: $0, checkValidity: $1) }
+        /// Whether an app's signature is valid and satisfies a code-signing requirement.
+        var satisfies: (URL, String) -> Bool = { Updater.satisfies($0, requirement: $1) }
         /// Starts the detached swap helper (`/bin/sh -c script`).
         var launchHelper: (String) throws -> Void = { script in
             let task = Process()
@@ -57,10 +59,12 @@ final class Updater {
         /// Asks the app to quit. Returns only if quitting was refused.
         var quit: @MainActor () -> Void = { NSApp.terminate(nil) }
         var relaunchCommand = "/usr/bin/open"
-        /// What the helper runs if the swap fails after the app has quit (nothing else is left to tell the user).
-        var failureAlertCommand = """
-        /usr/bin/osascript -e 'display alert "Camera Copy couldn’t finish updating" message "The previous version was kept. Download the latest Camera Copy from github.com/\(Updater.repo)/releases."' >/dev/null 2>&1
-        """
+        /// The shell command the helper runs to tell the user a swap failed after the app quit
+        /// (nothing else is left to tell them). Takes the message to show.
+        var failureAlertCommand: (String) -> String = { message in
+            "/usr/bin/osascript -e 'on run argv' -e 'display alert \"Camera Copy couldn’t finish updating\" message (item 1 of argv)' -e 'end run' "
+                + Updater.shellQuote(message) + " >/dev/null 2>&1"
+        }
         var tempDirectory = FileManager.default.temporaryDirectory
     }
 
@@ -195,7 +199,7 @@ final class Updater {
             let zipURL = try await download(info.downloadURL)
             Self.log.info("Downloaded \(info.downloadURL.lastPathComponent, privacy: .public)")
             status = .installing
-            let newApp = try prepare(zipURL)
+            let newApp = try prepare(zipURL, expectedVersion: info.version)
             Self.log.info("Verified signer of the new app; starting swap helper")
             try env.launchHelper(helperScript(newApp: newApp, afterPID: ProcessInfo.processInfo.processIdentifier))
             Self.log.info("Swap helper started; quitting so it can replace the app")
@@ -227,8 +231,9 @@ final class Updater {
         return dest
     }
 
-    /// Unzips the download, checks it is Aiden's own signed build, and clears quarantine.
-    func prepare(_ zipURL: URL) throws -> URL {
+    /// Unzips the download, checks it is Aiden's own signed build of the version the release says,
+    /// and clears quarantine.
+    func prepare(_ zipURL: URL, expectedVersion: String) throws -> URL {
         let fm = FileManager.default
         let workDir = env.tempDirectory.appendingPathComponent("CameraCopyUpdate-\(UUID().uuidString)", isDirectory: true)
         try fm.createDirectory(at: workDir, withIntermediateDirectories: true)
@@ -240,22 +245,49 @@ final class Updater {
             .first(where: { $0.pathExtension == "app" }) else {
             throw UpdateError.badArchive
         }
+        // The app must be a real folder, not a symlink pointing somewhere else.
+        if (try? newApp.resourceValues(forKeys: [.isSymbolicLinkKey]).isSymbolicLink) == true { throw UpdateError.badArchive }
         try verifySameSigner(newApp)
+        // No mislabelled or older build: the app inside must be the release's version, and newer than this one.
+        let found = Bundle(url: newApp)?.infoDictionary?["CFBundleShortVersionString"] as? String ?? "?"
+        guard Self.compare(Self.parse(found), Self.parse(expectedVersion)) == .orderedSame,
+              Self.compare(Self.parse(found), Self.parse(currentVersion)) == .orderedDescending else {
+            throw UpdateError.wrongVersion(found: found, expected: expectedVersion)
+        }
         try Self.run("/usr/bin/xattr", ["-dr", "com.apple.quarantine", newApp.path])
         return newApp
     }
 
-    /// The new app must have a valid signature from the same team, with the same bundle ID, as this one.
+    /// The new app must be signed with a Developer ID certificate issued by Apple to the same team,
+    /// with the same bundle ID, as this app. Checking against an Apple-anchored requirement matters:
+    /// the team ID written in a signature can be forged (`codesign -s - --team-identifier`), the
+    /// certificate chain to Apple can't.
     func verifySameSigner(_ newApp: URL) throws {
-        guard let mine = env.signingIdentity(appURL, false), let team = mine.team else {
+        guard let mine = env.signingIdentity(appURL, false), let team = mine.team, let bundleID = mine.bundleID else {
             throw UpdateError.untrusted("this copy of Camera Copy isn't signed with a Developer ID")
         }
         guard let theirs = env.signingIdentity(newApp, true) else {
             throw UpdateError.untrusted("its code signature is missing or broken")
         }
-        guard theirs.team == team, theirs.bundleID == mine.bundleID else {
-            throw UpdateError.untrusted("it was signed by someone else")
+        guard theirs.team == team, theirs.bundleID == bundleID,
+              env.satisfies(newApp, Self.developerIDRequirement(team: team, bundleID: bundleID)) else {
+            throw UpdateError.untrusted("it isn't signed with Aiden's Developer ID certificate")
         }
+    }
+
+    /// Apple-issued Developer ID Application certificate (the two OIDs), for this team, with this identifier.
+    nonisolated static func developerIDRequirement(team: String, bundleID: String) -> String {
+        "anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] and "
+            + "certificate leaf[field.1.2.840.113635.100.6.1.13] and "
+            + "certificate leaf[subject.OU] = \"\(team)\" and identifier \"\(bundleID)\""
+    }
+
+    nonisolated static func satisfies(_ app: URL, requirement: String) -> Bool {
+        var code: SecStaticCode?, req: SecRequirement?
+        guard SecStaticCodeCreateWithPath(app as CFURL, [], &code) == errSecSuccess, let code,
+              SecRequirementCreateWithString(requirement as CFString, [], &req) == errSecSuccess, let req else { return false }
+        let flags = SecCSFlags(rawValue: kSecCSCheckAllArchitectures | kSecCSCheckNestedCode | kSecCSStrictValidate)
+        return SecStaticCodeCheckValidity(code, flags, req) == errSecSuccess
     }
 
     nonisolated static func signingIdentity(of app: URL, checkValidity: Bool = false) -> (team: String?, bundleID: String?)? {
@@ -275,22 +307,30 @@ final class Updater {
     /// until the new one is in place), and relaunches. On failure it puts the old app back,
     /// logs, and shows a macOS alert, so a failed swap is never silent.
     func helperScript(newApp: URL, afterPID pid: Int32) -> String {
-        let current = Self.shellQuote(appURL.path)
-        let old = Self.shellQuote(appURL.path + ".old-\(UUID().uuidString)")
-        let fail = env.failureAlertCommand
+        let oldPath = appURL.path + ".old-\(UUID().uuidString)"
+        let current = Self.shellQuote(appURL.path), old = Self.shellQuote(oldPath)
+        let releases = "github.com/\(Self.repo)/releases"
+        let nothingChanged = env.failureAlertCommand(
+            "Nothing was changed. Open Camera Copy again, or download the latest version from \(releases).")
+        let kept = env.failureAlertCommand("The previous version was kept. Download the latest Camera Copy from \(releases).")
+        let lost = env.failureAlertCommand(
+            "The previous version couldn’t be put back. It is at \(oldPath). Rename it to \(appURL.lastPathComponent), or download Camera Copy from \(releases).")
         return """
         log() { /usr/bin/logger -t CameraCopyUpdater "$1"; }
         log "waiting for pid \(pid) to quit"
         while /bin/kill -0 \(pid) 2>/dev/null; do /bin/sleep 0.2; done
         log "app quit; swapping"
-        if ! /bin/mv \(current) \(old); then log "couldn't move the old app aside"; \(fail); exit 1; fi
+        if ! /bin/mv \(current) \(old); then log "couldn't move the old app aside"; \(nothingChanged); exit 1; fi
         if /bin/mv \(Self.shellQuote(newApp.path)) \(current); then
             /bin/rm -rf \(old)
             log "swapped; relaunching"
-        else
-            /bin/mv \(old) \(current)
+        elif /bin/mv \(old) \(current); then
             log "couldn't move the new app in; old app restored"
-            \(fail)
+            \(kept)
+        else
+            log "couldn't move the new app in or put the old one back; it is at \(oldPath)"
+            \(lost)
+            exit 1
         fi
         \(env.relaunchCommand) \(current)
         """
@@ -324,6 +364,7 @@ final class Updater {
     enum UpdateError: LocalizedError {
         case noRelease, noAsset, downloadFailed, badArchive, commandFailed(String)
         case untrusted(String), translocated, notWritable(String), quitRefused
+        case wrongVersion(found: String, expected: String)
         var errorDescription: String? {
             switch self {
             case .noRelease: return "No release found on GitHub."
@@ -335,6 +376,8 @@ final class Updater {
             case .translocated: return "Move Camera Copy to your Applications folder, open it from there, then update."
             case .notWritable(let dir): return "Camera Copy can't replace itself in \(dir). Move it to your Applications folder."
             case .quitRefused: return "Camera Copy couldn't quit to finish the update. Quit it, and the new version will open."
+            case .wrongVersion(let found, let expected):
+                return "The update wasn't installed because the download is version \(found), not \(expected) as the release says."
             }
         }
     }

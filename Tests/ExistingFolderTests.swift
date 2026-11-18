@@ -114,6 +114,11 @@ final class ExistingFolderTests: TempDirTestCase {
         XCTAssertEqual(ExistingFolder.plan(media, listing: ExistingFolder.list(dest)).alreadyThere[id(media, "Y.JPG")]?.name, "Y-02.JPG")
     }
 
+    func testFreeName() {
+        XCTAssertEqual(ExistingFolder.freeName("DSC1.ARW", taken: []), "DSC1-2.ARW")
+        XCTAssertEqual(ExistingFolder.freeName("DSC1.ARW", taken: ["dsc1-2.arw", "dsc1-3.arw"]), "DSC1-4.ARW")
+    }
+
     func testSuffixedNameHelper() {
         XCTAssertEqual(ExistingFolder.suffixedName("A.JPG", 1), "A.JPG")
         XCTAssertEqual(ExistingFolder.suffixedName("A.JPG", 3), "A-3.JPG")
