@@ -10,10 +10,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         guard let model = MainActor.assumeIsolated({ model }),
               MainActor.assumeIsolated({ model.phase == .importing }) else { return .terminateNow }
+        let warning = MainActor.assumeIsolated { model.quitWarning }
         let alert = NSAlert()
-        alert.messageText = "An import is still running"
-        alert.informativeText = "If you quit now, the folder will be incomplete and nothing on the card will be verified."
-        alert.addButton(withTitle: "Keep Importing")
+        alert.messageText = warning.title
+        alert.informativeText = warning.detail
+        alert.addButton(withTitle: warning.title.contains("check") ? "Keep Checking" : "Keep Importing")
         alert.addButton(withTitle: "Quit Anyway")
         alert.alertStyle = .warning
         return alert.runModal() == .alertFirstButtonReturn ? .terminateCancel : .terminateNow

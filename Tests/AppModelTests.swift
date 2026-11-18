@@ -598,6 +598,133 @@ final class AppModelTests: TempDirTestCase {
         XCTAssertEqual(m.independentCheck.state, .idle)
     }
 
+    // MARK: Check-only wording (nothing new on the card)
+
+    /// A folder that already has every card file, identical.
+    private func folderWithEverything() throws -> URL {
+        let shoot = out.appendingPathComponent("Shoot")
+        try FileManager.default.createDirectory(at: shoot, withIntermediateDirectories: true)
+        for f in try CardScanner.scan(root: card).media {
+            try FileManager.default.copyItem(at: f.url, to: shoot.appendingPathComponent(f.destName))
+        }
+        return shoot
+    }
+
+    /// Hashes for real, slowly, so a test can look at the screen mid-run.
+    private func slowHasher(_ delay: TimeInterval) -> @Sendable (URL, CancelToken, (Int64) -> Void) throws -> String {
+        { url, cancel, progress in
+            Thread.sleep(forTimeInterval: delay)
+            return try Importer.hashFile(url, cancel: cancel, progress: progress)
+        }
+    }
+
+    private func chooseExisting(_ m: AppModel, _ folder: URL) async throws {
+        m.existingFolderPath = folder.path
+        m.destinationMode = .newFolder; m.destinationMode = .existingFolder
+        try await searched(m)
+    }
+
+    func testCheckOnlyNeverSaysImport() async throws {
+        try makeCard()
+        let shoot = try folderWithEverything()
+        let before = try snapshot(shoot)
+        let m = try await readyModel()
+        try await chooseExisting(m, shoot)
+        XCTAssertEqual(m.importButtonTitle, "Check 5 Files Are Identical")
+        XCTAssertTrue(m.existingFolderSummary.contains("copies nothing unless one differs"), m.existingFolderSummary)
+        XCTAssertFalse(m.existingFolderSummary.contains("Import"))
+
+        m.hasher = slowHasher(0.15)
+        m.startImport()
+        let deadline = Date().addingTimeInterval(10)
+        while m.phase != .importing && Date() < deadline { try await Task.sleep(for: .milliseconds(5)) }
+        XCTAssertEqual(m.runSectionTitle, "Checking")
+        XCTAssertEqual(m.cancelTitle, "Stop Checking")
+        XCTAssertEqual(m.runHeadline, "Comparing… (nothing will be copied)")
+        XCTAssertEqual(m.quitWarning.title, "A check is still running")
+        try await wait(m, for: .done)
+
+        XCTAssertEqual(m.resultTone, .good)
+        XCTAssertEqual(m.resultTitle, "All 5 already in the folder, identical")
+        XCTAssertTrue(m.resultDetail.hasPrefix("Nothing copied."), m.resultDetail)
+        XCTAssertEqual(try snapshot(shoot), before, "a check writes nothing: no checksums file, no copies")
+        XCTAssertFalse(m.manifestWritten)
+    }
+
+    func testStoppedCheckShowsNotCheckedNotFailures() async throws {
+        try makeCard()
+        let shoot = try folderWithEverything()
+        let before = try snapshot(shoot)
+        let m = try await readyModel()
+        try await chooseExisting(m, shoot)
+        m.hasher = slowHasher(0.3)
+        m.startImport()
+        while m.currentIndex < 2 { try await Task.sleep(for: .milliseconds(5)) }
+        m.cancelImport()
+        try await wait(m, for: .done)
+
+        XCTAssertEqual(m.problemCount, 0, "files not compared are never failures")
+        XCTAssertGreaterThan(m.notCheckedCount, 0)
+        XCTAssertTrue(m.cardFiles.allSatisfy { !m.isProblem($0) }, "nothing red")
+        XCTAssertEqual(m.resultTone, .stopped)
+        let confirmed = m.alreadyThereCount
+        XCTAssertEqual(m.resultTitle, "Stopped: \(confirmed) of 5 confirmed identical")
+        XCTAssertEqual(m.resultDetail, "\(m.notCheckedCount) not checked. Nothing was copied.")
+        XCTAssertFalse(m.resultTitle.contains("mport") || m.resultDetail.contains("wipe"))
+        XCTAssertEqual(try snapshot(shoot), before, "stopping leaves the folder exactly as it was")
+
+        m.hasher = { try Importer.hashFile($0, cancel: $1, progress: $2) }
+        XCTAssertTrue(m.canCheckRemaining)
+        m.checkRemaining()
+        try await wait(m, for: .done)
+        XCTAssertEqual(m.resultTitle, "All 5 already in the folder, identical")
+        XCTAssertEqual(try snapshot(shoot), before)
+    }
+
+    func testCopyingWordsOnlyWhenAFileReallyDiffers() async throws {
+        try makeCard()
+        let shoot = try folderWithEverything()
+        try FileManager.default.removeItem(at: shoot.appendingPathComponent("C0001.MP4"))
+        try makeFile("C0001.MP4", size: 9000, in: shoot)              // same name and size, different clip
+        let m = try await readyModel()
+        try await chooseExisting(m, shoot)
+        XCTAssertEqual(m.importButtonTitle, "Check 5 Files Are Identical")
+        m.startImport()
+        try await wait(m, for: .done)
+        XCTAssertEqual(m.differingCount, 1)
+        XCTAssertEqual(m.resultTitle, "4 identical, 1 copied as new names")
+        XCTAssertTrue(m.resultDetail.contains("copied alongside it"), m.resultDetail)
+        XCTAssertTrue(m.manifestWritten, "something was copied, so its checksum is saved")
+        XCTAssertTrue(try names(in: shoot).contains("C0001-2.MP4"))
+    }
+
+    func testImportWordingStaysForRealImports() async throws {
+        try makeCard()
+        let m = try await readyModel()
+        XCTAssertEqual(m.importButtonTitle, "Import 5 Files")
+        let shoot = out.appendingPathComponent("Shoot")
+        try FileManager.default.createDirectory(at: shoot, withIntermediateDirectories: true)
+        try FileManager.default.copyItem(at: card.appendingPathComponent("PRIVATE/M4ROOT/CLIP/C0001.MP4"), to: shoot.appendingPathComponent("C0001.MP4"))
+        try await chooseExisting(m, shoot)
+        XCTAssertEqual(m.importButtonTitle, "Import 4 New Files")
+        m.startImport()
+        try await wait(m, for: .done)
+        XCTAssertFalse(m.runIsCheckOnly)
+        XCTAssertEqual(m.runSectionTitle, "Importing")
+        XCTAssertEqual(m.cancelTitle, "Cancel Import")
+        XCTAssertEqual(m.resultTitle, "4 copied, 1 already there")
+    }
+
+    func testNounFollowsTheCard() async throws {
+        try makeCard()
+        let m = try await readyModel()
+        let photos = m.cardFiles.filter { $0.kind == .photo }, videos = m.cardFiles.filter { $0.kind == .video }
+        XCTAssertEqual(m.noun(for: photos, count: 2), "photos")
+        XCTAssertEqual(m.noun(for: photos, count: 1), "photo")
+        XCTAssertEqual(m.noun(for: videos, count: 3), "videos")
+        XCTAssertEqual(m.noun(for: m.cardFiles, count: 5), "files")
+    }
+
     private func snapshot(_ dir: URL) throws -> [String: String] {
         var r: [String: String] = [:]
         for n in try names(in: dir) { r[n] = try Data(contentsOf: dir.appendingPathComponent(n)).sha256Hex }

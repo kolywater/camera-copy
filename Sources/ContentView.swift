@@ -13,7 +13,7 @@ struct ContentView: View {
 
     /// The filter only applies while its toggle is visible, so it can never hide everything with no way back.
     private var showingProblemsOnly: Bool {
-        problemsOnly && model.phase == .done && !model.allVerified
+        problemsOnly && model.phase == .done && model.problemCount > 0
     }
 
     var body: some View {
@@ -92,7 +92,7 @@ struct ContentView: View {
     @ToolbarContentBuilder
     private var toolbarContent: some ToolbarContent {
         ToolbarItemGroup {
-            if model.phase == .done && !model.allVerified {
+            if model.phase == .done && model.problemCount > 0 {
                 Toggle("Problems Only", isOn: $problemsOnly)
                     .toggleStyle(.button)
                     .help("Show only files that failed verification")
@@ -206,7 +206,7 @@ struct Sidebar: View {
             .disabled(model.phase == .importing)
 
             if model.phase == .importing {
-                Section("Importing") { ImportProgress(model: model) }
+                Section(model.runSectionTitle) { ImportProgress(model: model) }
             } else if model.phase == .done {
                 Section("Result") { ResultSummary(model: model) }
             }
@@ -219,11 +219,11 @@ struct Sidebar: View {
             Group {
                 if model.phase == .importing {
                     Button(role: .cancel) { model.cancelImport() } label: {
-                        Text("Cancel Import").frame(maxWidth: .infinity)
+                        Text(model.cancelTitle).frame(maxWidth: .infinity)
                     }
                 } else {
                     Button { model.startImport() } label: {
-                        Text(importTitle).frame(maxWidth: .infinity)
+                        Text(model.importButtonTitle).frame(maxWidth: .infinity)
                     }
                     .buttonStyle(.borderedProminent)
                     .keyboardShortcut(.defaultAction)
@@ -233,17 +233,6 @@ struct Sidebar: View {
             .controlSize(.large)
             .padding(16)
         }
-    }
-
-    private var importTitle: String {
-        if model.cardFiles.isEmpty { return "Import" }
-        guard model.destinationMode == .existingFolder, model.existingFolderError == nil else {
-            return "Import \(Format.count(model.cardFiles.count)) Files"
-        }
-        if model.searchingFolder { return "Searching the Folder…" }
-        let n = model.filesToCopyCount
-        if n == 0 { return "Confirm \(Format.count(model.alreadyThere.count)) Matching Files" }
-        return "Import \(Format.count(n)) New \(n == 1 ? "File" : "Files")"
     }
 
     private var sourceDetail: String {
@@ -276,14 +265,11 @@ struct ExistingFolderNote: View {
                     Text("Searching the folder and its subfolders…").foregroundStyle(.secondary)
                 }
             } else if model.phase == .ready || model.phase == .done {
-                let there = model.alreadyThere.count
-                let new = model.filesToCopyCount
                 HStack(alignment: .firstTextBaseline, spacing: 6) {
-                    Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
-                    Text((there == model.cardFiles.count
-                      ? "The folder has all \(Format.count(there)) files by name and size."
-                      : "\(Format.count(new)) to copy, \(Format.count(there)) with the same name and size.")
-                     + " Importing compares those by checksum; any that differ are copied with a new name.")
+                    if model.alreadyThere.count > 0 {
+                        Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
+                    }
+                    Text(model.existingFolderSummary)
                 }
             }
         }
@@ -297,6 +283,10 @@ struct ImportProgress: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
+            // What is happening, in plain words: comparing (nothing copied) or copying.
+            Text(model.runHeadline)
+                .font(.callout.weight(.medium))
+                .fixedSize(horizontal: false, vertical: true)
             ProgressView(value: Double(model.bytesDone), total: Double(max(model.bytesTotal, 1)))
             if let timeLeft = model.timeLeftText {
                 // Covers the whole job, verification included, so it reaches zero when the import ends.
@@ -326,12 +316,12 @@ struct ResultSummary: View {
 
     var body: some View {
         HStack(alignment: .top, spacing: 10) {
-            Image(systemName: model.allVerified ? "checkmark.seal.fill" : "exclamationmark.octagon.fill")
-                .foregroundStyle(model.allVerified ? .green : .red)
+            Image(systemName: icon)
+                .foregroundStyle(tint)
                 .font(.title)
             VStack(alignment: .leading, spacing: 3) {
-                Text(title).font(.headline)
-                Text(detail).font(.caption).foregroundStyle(.secondary)
+                Text(model.resultTitle).font(.headline)
+                Text(model.resultDetail).font(.caption).foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
                 if !model.extraDestFiles.isEmpty {
                     Text("\(model.extraDestFiles.count) unexpected files in folder")
@@ -345,6 +335,13 @@ struct ResultSummary: View {
             }
         }
         .padding(.vertical, 4)
+        if model.notCheckedCount > 0 {
+            LabeledContent("Not checked") {
+                Button("Check the Remaining \(Format.count(model.notCheckedCount))") { model.checkRemaining() }
+                    .disabled(!model.canCheckRemaining)
+                    .help(model.sourceEjected ? "Reinsert the card to check the rest" : "Compare the rest by SHA-256; nothing is copied unless one differs")
+            }
+        }
         if model.problemCount > 0 && model.destinationURL != nil {
             LabeledContent("Failed files") {
                 Button("Retry \(Format.count(model.problemCount))") { model.retryFailed() }
@@ -362,23 +359,20 @@ struct ResultSummary: View {
         }
     }
 
-    private var title: String {
-        let there = model.alreadyThereCount
-        if model.allVerified && there > 0 {
-            return "\(Format.count(model.verifiedCount)) copied, \(Format.count(there)) already there"
+    private var icon: String {
+        switch model.resultTone {
+        case .good: return "checkmark.seal.fill"
+        case .stopped: return "pause.circle.fill"
+        case .bad: return "exclamationmark.octagon.fill"
         }
-        if model.allVerified { return "All \(Format.count(model.cardFiles.count)) files verified" }
-        if model.wasCancelled { return "Import cancelled" }
-        return "\(Format.count(model.problemCount)) files have problems"
     }
 
-    private var detail: String {
-        if model.allVerified {
-            let saved = model.manifestError == nil ? " Checksums saved to \(model.manifestFileName)." : ""
-            return "Every copy's SHA-256 checksum matches two separate reads of the card.\(saved)"
+    private var tint: Color {
+        switch model.resultTone {
+        case .good: return .green
+        case .stopped: return .secondary
+        case .bad: return .red
         }
-        let there = model.alreadyThereCount > 0 ? ", \(Format.count(model.alreadyThereCount)) already there" : ""
-        return "\(Format.count(model.verifiedCount)) verified\(there), \(Format.count(model.problemCount)) not. Don't wipe this card."
     }
 }
 
@@ -453,7 +447,10 @@ struct StatusIcon: View {
                     .help("Verified — SHA-256 \(hash)")
             case .alreadyThere:
                 Image(systemName: "checkmark.circle").foregroundStyle(.green)
-                    .help("Already in the folder (same name and size), so it wasn't copied")
+                    .help("Already in the folder, so it wasn't copied")
+            case .notChecked:
+                Image(systemName: "circle.dashed").foregroundStyle(.secondary)
+                    .help("Not checked yet: the check was stopped before reaching it")
             case .failed(let reason):
                 Image(systemName: "xmark.octagon.fill").foregroundStyle(.red).help(reason)
             case .verified:

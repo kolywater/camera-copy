@@ -85,6 +85,14 @@ final class AppModel {
     @ObservationIgnored private(set) var manifestFileName = Importer.manifestName
     /// How many files the running import (or retry) copies.
     var runCount = 0
+    /// The run only compares files already in the folder: nothing is new on the card.
+    private(set) var runIsCheckOnly = false
+    enum RunStage { case comparing, copying }
+    private(set) var runStage: RunStage = .copying
+    /// Files that matched by name and size but differ, and so were copied as a new "-N" name.
+    private(set) var differingCount = 0
+    /// Whether this run saved a checksums file (only when it copied something).
+    private(set) var manifestWritten = false
 
     /// Copies and verifies one file; tests swap in a faulty one to check how bad copies are reported.
     typealias Copier = @Sendable (_ from: URL, _ to: URL, _ size: Int64, _ modified: Date, _ mayReplace: Bool,
@@ -216,11 +224,26 @@ final class AppModel {
     }
 
     func isProblem(_ file: CardFile) -> Bool {
-        guard phase == .done else { return false }
+        guard phase == .done, statuses[file.id] != .notChecked else { return false }
         return statuses[file.id]?.isSafe != true || destFiles[file.id] == nil
     }
 
     var problemCount: Int { cardFiles.filter(isProblem).count }
+
+    /// Files not compared yet because the check was stopped.
+    var notCheckedCount: Int { cardFiles.filter { statuses[$0.id] == .notChecked }.count }
+
+    var canCheckRemaining: Bool {
+        phase == .done && destinationURL != nil && !sourceEjected && notCheckedCount > 0
+    }
+
+    /// Compares the files a stopped check didn't get to. Nothing is copied unless one differs.
+    func checkRemaining() {
+        guard canCheckRemaining, let dest = destinationURL else { return }
+        let rest = cardFiles.filter { statuses[$0.id] == .notChecked }
+        for f in rest { statuses[f.id] = .pending }
+        run([], into: dest, confirming: rest.compactMap { f in alreadyThere[f.id].map { (card: f, folder: candidateLists[f.id] ?? [$0]) } })
+    }
 
     var allVerified: Bool {
         phase == .done && !wasCancelled && !cardFiles.isEmpty && problemCount == 0
@@ -582,6 +605,10 @@ final class AppModel {
         bytesTotal = files.reduce(0) { $0 + $1.size } * 3   // copy + read back the copy + re-read the card
             + candidates.reduce(0) { $0 + $1.card.size } * 2  // read the card file + read the folder file
         runCount = files.count + candidates.count
+        runIsCheckOnly = files.isEmpty && !candidates.isEmpty
+        runStage = candidates.isEmpty ? .copying : .comparing
+        differingCount = 0
+        manifestWritten = false
         timeLeftText = "Estimating…"
         currentIndex = 0
         wasCancelled = false
@@ -689,6 +716,11 @@ final class AppModel {
                     return updated
                 }
             }
+            let differ = renamed.count
+            await MainActor.run {
+                self.differingCount = differ
+                self.runStage = .copying
+            }
             let toCopy = files + renamed
             let offset = candidates.count
 
@@ -743,14 +775,19 @@ final class AppModel {
                     return nil
                 }
             }
+            // Only when something was copied: a check that copies nothing writes nothing at all.
             var manifestError: String?
-            do {
-                try Importer.writeManifest(manifest, to: dest, named: manifestName)
-            } catch {
-                manifestError = error.localizedDescription
+            var written = false
+            if !manifest.isEmpty {
+                do {
+                    try Importer.writeManifest(manifest, to: dest, named: manifestName)
+                    written = true
+                } catch {
+                    manifestError = error.localizedDescription
+                }
             }
-            let savedError = manifestError
-            await MainActor.run { self.manifestError = savedError }
+            let savedError = manifestError, savedWritten = written
+            await MainActor.run { self.manifestError = savedError; self.manifestWritten = savedWritten }
             await self.reconcile(dest: dest, cancelled: token.isCancelled)
         }
     }
@@ -765,7 +802,17 @@ final class AppModel {
         var expected = Set<String>()
         var found: [String: DestFile] = [:]
 
+        // Files a stopped run never got to compare are "not checked yet", not failures.
+        if cancelled {
+            for file in cardFiles where alreadyThere[file.id] != nil {
+                switch statuses[file.id] {
+                case .pending, .copying, .failed("Cancelled"): statuses[file.id] = .notChecked
+                default: break
+                }
+            }
+        }
         for file in cardFiles {
+            if statuses[file.id] == .notChecked { continue }
             // Confirmed already there, possibly in a subfolder: look at that very file again.
             if statuses[file.id] == .alreadyThere, let match = alreadyThere[file.id] {
                 guard let d = Importer.destFile(at: match.url) else {

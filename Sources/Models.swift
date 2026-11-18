@@ -30,6 +30,8 @@ enum VerifyStatus: Equatable {
     case verified(hash: String)
     /// Add-to-existing-folder mode: the folder already has this file (same name and size), so it wasn't copied.
     case alreadyThere
+    /// A same-name-and-size file that wasn't compared because the check was stopped. Neutral, not a failure.
+    case notChecked
     case failed(String)
 
     var isVerified: Bool {
