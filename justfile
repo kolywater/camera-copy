@@ -4,6 +4,31 @@ app := "build/Build/Products/Release/CameraCopy.app"
 build:
     cd {{justfile_directory()}} && xcodegen generate --quiet && xcodebuild -project CameraCopy.xcodeproj -scheme CameraCopy -configuration Release -derivedDataPath build build -quiet
 
+# Run the unit tests with code coverage, then print coverage per source file
+test:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cd {{justfile_directory()}}
+    xcodegen generate --quiet
+    rm -rf build/TestResults.xcresult
+    xcodebuild test -project CameraCopy.xcodeproj -scheme CameraCopy -derivedDataPath build \
+        -destination "platform=macOS" -enableCodeCoverage YES -resultBundlePath build/TestResults.xcresult -quiet
+    echo ""
+    echo "Coverage per file (app sources only):"
+    xcrun xccov view --report --files-for-target CameraCopyTests.xctest build/TestResults.xcresult \
+        | grep -E "Sources/|^ *(ID|--)" | grep -v "/Tests/" || true
+
+# Click the real update button in a UI test (needs macOS to allow UI automation; asks for a password the first time)
+test-ui:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cd {{justfile_directory()}}
+    xcodegen generate --quiet
+    rm -rf build/UITestResults.xcresult
+    # Built as 1.0 so GitHub's latest release is offered; the update replaces only this test copy in build/ui.
+    xcodebuild test -project CameraCopy.xcodeproj -scheme CameraCopyUITests -derivedDataPath build/ui \
+        -destination "platform=macOS" MARKETING_VERSION=1.0 -resultBundlePath build/UITestResults.xcresult -quiet
+
 # Build and launch
 run: build
     open {{justfile_directory()}}/{{app}}
@@ -57,6 +82,8 @@ release version:
     if [[ "$(gh api user --jq .login)" != "kolywater" ]]; then
         echo "Error: gh isn't signed in as kolywater. Run: gh auth switch -u kolywater"; exit 1
     fi
+    # Nothing ships unless every unit test passes.
+    if ! just test; then echo "Error: tests failed, so nothing was released."; exit 1; fi
 
     echo "Setting MARKETING_VERSION to $version"
     sed -i '' -E "s/(MARKETING_VERSION: )\"?[0-9.]+\"?/\1\"$version\"/" project.yml

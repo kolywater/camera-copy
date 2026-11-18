@@ -24,3 +24,50 @@ targets:
         ENABLE_APP_SANDBOX: NO
         ENABLE_HARDENED_RUNTIME: YES
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+    scheme:
+      testTargets: [CameraCopyTests]
+      gatherCoverageData: true
+
+  # Unit tests. They compile the app's sources directly (everything but the @main app file),
+  # so they run without launching the app.
+  CameraCopyTests:
+    type: bundle.unit-test
+    platform: macOS
+    sources:
+      - path: Sources
+        excludes: ["CameraCopyApp.swift", "Assets.xcassets"]
+      - Tests
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.aiden.CameraCopyTests
+        GENERATE_INFOPLIST_FILE: YES
+        SWIFT_VERSION: "5.0"
+        CODE_SIGN_IDENTITY: "Apple Development"
+        CODE_SIGN_STYLE: Automatic
+        DEVELOPMENT_TEAM: N8666MD6Y8
+
+  # UI test: clicks the real update button. Separate scheme, run with `just test-ui` (needs Accessibility).
+  CameraCopyUITests:
+    type: bundle.ui-testing
+    platform: macOS
+    sources: [UITests]
+    dependencies:
+      - target: CameraCopy
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.aiden.CameraCopyUITests
+        GENERATE_INFOPLIST_FILE: YES
+        SWIFT_VERSION: "5.0"
+        TEST_TARGET_NAME: CameraCopy
+        CODE_SIGN_IDENTITY: "Apple Development"
+        CODE_SIGN_STYLE: Automatic
+        DEVELOPMENT_TEAM: N8666MD6Y8
+
+schemes:
+  CameraCopyUITests:
+    build:
+      targets:
+        CameraCopy: all
+        CameraCopyUITests: [test]
+    test:
+      targets: [CameraCopyUITests]

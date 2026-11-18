@@ -42,8 +42,3 @@ struct CameraCopyApp: App {
         }
     }
 }
-
-extension Notification.Name {
-    /// Posted by the "Check for Updates…" menu command; ContentView runs a user-initiated check.
-    static let checkForUpdatesRequested = Notification.Name("checkForUpdatesRequested")
-}

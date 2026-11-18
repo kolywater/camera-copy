@@ -1,0 +1,204 @@
+import XCTest
+
+/// End-to-end imports through the app's model, on fake cards in a temp folder.
+@MainActor
+final class AppModelTests: TempDirTestCase {
+    var card: URL { tmp.appendingPathComponent("CARD") }
+    var out: URL { tmp.appendingPathComponent("out") }
+
+    private func makeCard() throws {
+        try makeFile("CARD/DCIM/100MSDCF/DSC00001.ARW", size: 5000, modified: day(1))
+        try makeFile("CARD/DCIM/100MSDCF/DSC00001.JPG", size: 1500, modified: day(1))
+        try makeFile("CARD/DCIM/101MSDCF/DSC00001.ARW", size: 5200, modified: day(2))
+        try makeFile("CARD/DCIM/101MSDCF/DSC00001.JPG", size: 1700, modified: day(2))
+        try makeFile("CARD/PRIVATE/M4ROOT/CLIP/C0001.MP4", size: 9000, modified: day(3))
+        try makeFile("CARD/PRIVATE/M4ROOT/CLIP/C0001M01.XML", size: 100)
+    }
+
+    private func wait(_ model: AppModel, for phase: Phase, file: StaticString = #filePath, line: UInt = #line) async throws {
+        let deadline = Date().addingTimeInterval(30)
+        while model.phase != phase {
+            if Date() > deadline { XCTFail("timed out waiting for \(phase), at \(model.phase)", file: file, line: line); return }
+            try await Task.sleep(for: .milliseconds(20))
+        }
+    }
+
+    private func readyModel() async throws -> AppModel {
+        let m = AppModel()
+        m.sourcePath = card.path
+        m.parentPath = out.path
+        m.scanSource()
+        try await wait(m, for: .ready)
+        return m
+    }
+
+    func testNewFolderImportCopiesVerifiesAndWritesChecksums() async throws {
+        try makeCard()
+        try FileManager.default.createDirectory(at: out, withIntermediateDirectories: true)
+        let m = try await readyModel()
+        XCTAssertEqual(m.cardFiles.count, 5)
+        XCTAssertEqual(m.skippedFiles, ["PRIVATE/M4ROOT/CLIP/C0001M01.XML"])
+        XCTAssertNotNil(m.folderNameError)
+        m.folderName = "  Shoot  "
+        XCTAssertTrue(m.canImport)
+        m.startImport()
+        XCTAssertEqual(m.phase, .importing)
+        XCTAssertEqual(m.timeLeftText, "Estimating…")
+        try await wait(m, for: .done)
+        XCTAssertTrue(m.allVerified)
+        XCTAssertEqual(m.verifiedCount, 5)
+        let shoot = out.appendingPathComponent("Shoot")
+        XCTAssertEqual(try names(in: shoot), ["C0001.MP4", "DSC00001-2.ARW", "DSC00001-2.JPG", "DSC00001.ARW",
+                                               "DSC00001.JPG", "checksums.sha256"])
+        let check = Process()
+        check.executableURL = URL(fileURLWithPath: "/usr/bin/shasum"); check.arguments = ["-a", "256", "-c", "checksums.sha256"]
+        check.currentDirectoryURL = shoot; check.standardOutput = Pipe()
+        try check.run(); check.waitUntilExit()
+        XCTAssertEqual(check.terminationStatus, 0)
+
+        // The same name again is refused, so nothing is ever merged by accident.
+        m.startImport()
+        XCTAssertTrue(m.alertMessage?.contains("already exists") == true)
+    }
+
+    func testFolderNameRules() async throws {
+        try makeCard()
+        let m = try await readyModel()
+        for bad in ["", "   ", "a/b", "a:b", ".hidden"] {
+            m.folderName = bad
+            XCTAssertNotNil(m.folderNameError, bad)
+            XCTAssertFalse(m.canImport, bad)
+        }
+        m.folderName = "Iceland"
+        XCTAssertNil(m.folderNameError)
+        XCTAssertTrue(m.destinationPreview.hasSuffix("/Iceland"))
+    }
+
+    func testRefusesADestinationOnTheCard() async throws {
+        try makeCard()
+        let m = try await readyModel()
+        m.parentPath = card.appendingPathComponent("DCIM").path
+        m.folderName = "Shoot"
+        m.startImport()
+        XCTAssertTrue(m.alertMessage?.contains("on the card") == true)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: card.appendingPathComponent("DCIM/Shoot").path))
+    }
+
+    func testExistingFolderCopiesOnlyWhatIsMissingAndChangesNothingThere() async throws {
+        try makeCard()
+        let shoot = out.appendingPathComponent("Shoot")
+        try FileManager.default.createDirectory(at: shoot, withIntermediateDirectories: true)
+        // Already there: the first pair and the -2 RAW. A different photo uses the name C0001.MP4.
+        try FileManager.default.copyItem(at: card.appendingPathComponent("DCIM/100MSDCF/DSC00001.ARW"), to: shoot.appendingPathComponent("DSC00001.ARW"))
+        try FileManager.default.copyItem(at: card.appendingPathComponent("DCIM/100MSDCF/DSC00001.JPG"), to: shoot.appendingPathComponent("dsc00001.jpg"))
+        try FileManager.default.copyItem(at: card.appendingPathComponent("DCIM/101MSDCF/DSC00001.ARW"), to: shoot.appendingPathComponent("DSC00001-2.ARW"))
+        try makeFile("C0001.MP4", size: 123, in: shoot)
+        try Data("old checksums".utf8).write(to: shoot.appendingPathComponent("checksums.sha256"))
+        try makeFile("notes.txt", size: 10, in: shoot)
+        let before = try snapshot(shoot)
+
+        let m = try await readyModel()
+        m.destinationMode = .existingFolder
+        XCTAssertEqual(m.existingFolderError, "Choose a folder")
+        XCTAssertFalse(m.canImport)
+        m.existingFolderPath = shoot.path
+        m.destinationMode = .newFolder; m.destinationMode = .existingFolder     // re-plan with the folder chosen
+        XCTAssertNil(m.existingFolderError)
+        XCTAssertEqual(m.alreadyThere.count, 3)
+        XCTAssertEqual(m.filesToCopyCount, 2)
+        XCTAssertEqual(m.statuses.values.filter { $0 == .alreadyThere }.count, 3, "drives the grid checkmarks")
+        XCTAssertEqual(m.existingFolderDisplayName, "Shoot")
+
+        m.startImport()
+        try await wait(m, for: .done)
+        XCTAssertTrue(m.allVerified)
+        XCTAssertEqual(m.verifiedCount, 2)
+        XCTAssertEqual(m.alreadyThereCount, 3)
+        XCTAssertTrue(m.extraDestFiles.isEmpty, "other files in an existing folder aren't 'unexpected'")
+        XCTAssertNotEqual(m.manifestFileName, "checksums.sha256")
+
+        let after = try snapshot(shoot)
+        for (name, hash) in before { XCTAssertEqual(after[name], hash, "\(name) must be unchanged") }
+        XCTAssertEqual(Set(after.keys).subtracting(before.keys),
+                       ["DSC00001-2.JPG", "C0001-2.MP4", m.manifestFileName])
+    }
+
+    func testExistingFolderErrorsAndNothingNewToImport() async throws {
+        try makeCard()
+        let m = try await readyModel()
+        m.existingFolderPath = tmp.appendingPathComponent("gone").path
+        m.destinationMode = .existingFolder
+        XCTAssertEqual(m.existingFolderError, "That folder isn't there anymore")
+        m.existingFolderPath = card.appendingPathComponent("DCIM").path
+        XCTAssertEqual(m.existingFolderError, "That folder is on the card")
+        XCTAssertFalse(m.canImport)
+
+        // A folder that already has the whole card.
+        let full = out.appendingPathComponent("Full")
+        try FileManager.default.createDirectory(at: full, withIntermediateDirectories: true)
+        for f in m.cardFiles { try FileManager.default.copyItem(at: f.url, to: full.appendingPathComponent(f.destName)) }
+        m.existingFolderPath = full.path
+        m.destinationMode = .newFolder; m.destinationMode = .existingFolder
+        XCTAssertEqual(m.filesToCopyCount, 0)
+        XCTAssertFalse(m.canImport, "nothing new to import")
+    }
+
+    func testSwitchingBackToNewFolderRestoresTheScannerNames() async throws {
+        try makeCard()
+        let m = try await readyModel()
+        let scanned = m.cardFiles.map(\.destName)
+        let shoot = out.appendingPathComponent("Shoot")
+        try makeFile("DSC00001.ARW", size: 1, in: shoot)           // forces a different name in existing mode
+        m.existingFolderPath = shoot.path
+        m.destinationMode = .existingFolder
+        XCTAssertNotEqual(m.cardFiles.map(\.destName), scanned)
+        m.destinationMode = .newFolder
+        XCTAssertEqual(m.cardFiles.map(\.destName), scanned)
+        XCTAssertTrue(m.alreadyThere.isEmpty)
+    }
+
+    func testFailedFileCanBeRetried() async throws {
+        try makeCard()
+        let m = try await readyModel()
+        let unreadable = card.appendingPathComponent("PRIVATE/M4ROOT/CLIP/C0001.MP4")
+        try shell("/bin/chmod", ["000", unreadable.path])
+        m.folderName = "Shoot"
+        m.startImport()
+        try await wait(m, for: .done)
+        XCTAssertFalse(m.allVerified)
+        XCTAssertEqual(m.problemCount, 1)
+        XCTAssertTrue(m.canRetry)
+        try shell("/bin/chmod", ["644", unreadable.path])
+        m.retryFailed()
+        try await wait(m, for: .done)
+        XCTAssertTrue(m.allVerified)
+        XCTAssertEqual(m.runCount, 1, "the retry copies only the failed file")
+    }
+
+    func testCancelLeavesFilesMarkedNotCopied() async throws {
+        try makeCard()
+        let m = try await readyModel()
+        m.folderName = "Shoot"
+        m.startImport()
+        m.cancelImport()
+        try await wait(m, for: .done)
+        XCTAssertTrue(m.wasCancelled)
+        XCTAssertFalse(m.allVerified)
+    }
+
+    func testMissingSourceShowsAScanError() async throws {
+        let m = AppModel()
+        m.sourcePath = tmp.appendingPathComponent("no card").path
+        m.scanSource()
+        try await wait(m, for: .idle)
+        try await Task.sleep(for: .milliseconds(200))
+        XCTAssertNotNil(m.scanError)
+        XCTAssertEqual(m.sourceDisplayName, "no card")
+    }
+
+    private func snapshot(_ dir: URL) throws -> [String: String] {
+        var r: [String: String] = [:]
+        for n in try names(in: dir) { r[n] = try Data(contentsOf: dir.appendingPathComponent(n)).sha256Hex }
+        return r
+    }
+}

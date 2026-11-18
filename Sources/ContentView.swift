@@ -35,21 +35,27 @@ struct ContentView: View {
             // Quiet check on launch: only speaks up if there is an update.
             await updater.check(userInitiated: false)
         }
+        #if UPDATE_SELFTEST
+        // Test builds only: do what a click on "Install and Relaunch" does, then close the alert as SwiftUI does.
+        .task(id: updater.latest?.version) {
+            guard updater.latest != nil else { return }
+            try? await Task.sleep(for: .seconds(2))
+            updater.installButtonClicked()
+            updater.showUpdateAlert = false
+        }
+        #endif
         .onReceive(NotificationCenter.default.publisher(for: .checkForUpdatesRequested)) { _ in
             Task { await updater.check(userInitiated: true) }
         }
-        .alert("Update Available", isPresented: Binding(
-            get: { updater.available != nil && !updater.isBusy },
-            set: { if !$0 { updater.clearResult() } }
-        )) {
+        .alert("Update Available", isPresented: $updater.showUpdateAlert) {
             if model.phase == .importing {
                 Button("Later", role: .cancel) {}
             } else {
-                Button("Install and Relaunch") { Task { await updater.install() } }
+                Button("Install and Relaunch") { updater.installButtonClicked() }
                 Button("Later", role: .cancel) {}
             }
         } message: {
-            if let info = updater.available {
+            if let info = updater.latest {
                 let notes = info.notes.trimmingCharacters(in: .whitespacesAndNewlines)
                 let busy = model.phase == .importing ? "\n\nFinish the import first, then choose Check for Updates again." : ""
                 Text("Camera Copy \(info.version) is available (you have \(updater.currentVersion)).\(busy)"
