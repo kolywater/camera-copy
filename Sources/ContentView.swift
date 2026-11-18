@@ -84,7 +84,7 @@ struct ContentView: View {
     private var updateInfoMessage: String? {
         switch updater.status {
         case .upToDate: return "You're running the latest version (\(updater.currentVersion))."
-        case .failed(let reason): return "Couldn't update.\n\n\(reason)"
+        case .failed(let reason): return "Couldn't update. Camera Copy wasn't changed.\n\n\(reason)"
         default: return nil
         }
     }
@@ -238,9 +238,7 @@ struct Sidebar: View {
     private var sourceDetail: String {
         switch model.phase {
         case _ where model.sourceEjected:
-            if model.phase == .done && model.allVerified { return "Ejected · safe to remove" }
-            if model.phase == .importing || model.phase == .done { return "Card removed during import" }
-            return "Ejected · plug in a card"
+            return model.ejectedDetail
         case .idle: return model.scanError ?? "Plug in a card"
         case .scanning: return "Reading card…"
         default: return "\(Format.count(model.cardFiles.count)) items · \(Format.size(model.totalCardBytes))"
@@ -255,7 +253,7 @@ struct ExistingFolderNote: View {
     var body: some View {
         Group {
             if model.existingFolderPath.isEmpty {
-                Text("Files the folder already has (same name and size) are skipped. Nothing in it is replaced.")
+                Text(model.existingFolderHint)
                     .foregroundStyle(.secondary)
             } else if let error = model.existingFolderError {
                 Text(error).foregroundStyle(.red)
@@ -267,7 +265,8 @@ struct ExistingFolderNote: View {
             } else if model.phase == .ready || model.phase == .done {
                 HStack(alignment: .firstTextBaseline, spacing: 6) {
                     if model.alreadyThere.count > 0 {
-                        Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
+                        // Neutral until the checksums are compared: nothing is confirmed yet.
+                        Image(systemName: "magnifyingglass").foregroundStyle(.secondary)
                     }
                     Text(model.existingFolderSummary)
                 }
@@ -297,7 +296,7 @@ struct ImportProgress: View {
                     .animation(.default, value: timeLeft)
             }
             HStack {
-                Text("\(Format.count(model.currentIndex)) of \(Format.count(model.runCount))")
+                Text(model.runCountText)
                     .monospacedDigit()
                 Spacer()
                 Text(model.currentFileName)
@@ -335,11 +334,11 @@ struct ResultSummary: View {
             }
         }
         .padding(.vertical, 4)
-        if model.notCheckedCount > 0 {
-            LabeledContent("Not checked") {
-                Button("Check the Remaining \(Format.count(model.notCheckedCount))") { model.checkRemaining() }
-                    .disabled(!model.canCheckRemaining)
-                    .help(model.sourceEjected ? "Reinsert the card to check the rest" : "Compare the rest by SHA-256; nothing is copied unless one differs")
+        if model.unfinishedCount > 0 {
+            LabeledContent("Not finished") {
+                Button(model.finishButtonTitle) { model.finishRemaining() }
+                    .disabled(!model.canFinishRemaining)
+                    .help(model.sourceEjected ? "Put the card back in to finish" : "Pick up where it stopped")
             }
         }
         if model.problemCount > 0 && model.destinationURL != nil {
@@ -354,8 +353,10 @@ struct ResultSummary: View {
         }
         LabeledContent("Card") {
             Button(model.sourceEjected ? "Ejected" : "Eject") { model.ejectCard() }
-                .disabled(!model.allVerified || model.sourceEjected || model.independentCheck.isRunning)
-                .help(model.allVerified ? "Safely eject the card" : "Not every file verified")
+                .disabled(!model.allVerified || model.sourceEjected || model.independentCheck.isRunning
+                          || model.independentCheck.state == .missing)
+                .help(model.independentCheck.state == .missing ? "The independent check found missing files; keep the card"
+                      : model.allVerified ? "Safely eject the card" : "Not every file is confirmed yet; keep the card")
         }
     }
 
@@ -363,6 +364,7 @@ struct ResultSummary: View {
         switch model.resultTone {
         case .good: return "checkmark.seal.fill"
         case .stopped: return "pause.circle.fill"
+        case .attention: return "exclamationmark.triangle.fill"
         case .bad: return "exclamationmark.octagon.fill"
         }
     }
@@ -371,6 +373,7 @@ struct ResultSummary: View {
         switch model.resultTone {
         case .good: return .green
         case .stopped: return .secondary
+        case .attention: return .orange
         case .bad: return .red
         }
     }
@@ -450,7 +453,10 @@ struct StatusIcon: View {
                     .help("Already in the folder, so it wasn't copied")
             case .notChecked:
                 Image(systemName: "circle.dashed").foregroundStyle(.secondary)
-                    .help("Not checked yet: the check was stopped before reaching it")
+                    .help("Same name and size in the folder; checksums not compared yet")
+            case .notCopied:
+                Image(systemName: "circle.dashed").foregroundStyle(.secondary)
+                    .help("Not copied yet")
             case .failed(let reason):
                 Image(systemName: "xmark.octagon.fill").foregroundStyle(.red).help(reason)
             case .verified:
@@ -479,7 +485,9 @@ struct ComparisonList: View {
                                   dest: model.destFiles[file.id],
                                   status: model.statuses[file.id],
                                   imported: model.destinationURL != nil,
-                                  done: model.phase == .done)
+                                  done: model.phase == .done,
+                                  problem: model.isProblem(file),
+                                  subtitle: model.destFiles[file.id].flatMap { model.rowSubtitle(file, $0) })
                     Divider()
                 }
                 if !model.extraDestFiles.isEmpty {
@@ -508,6 +516,9 @@ struct ComparisonRow: View {
     let status: VerifyStatus?
     let imported: Bool
     let done: Bool
+    /// Only real failures are tinted red; unfinished or already-there files are not.
+    let problem: Bool
+    let subtitle: String?
 
     var body: some View {
         HStack(spacing: 0) {
@@ -518,12 +529,16 @@ struct ComparisonRow: View {
                 .frame(width: 44)
             Group {
                 if let dest {
-                    FileCell(url: dest.url, name: dest.name, size: dest.size, date: dest.modified,
-                             subtitle: dest.name == file.name ? nil : "renamed to avoid a duplicate name")
+                    VStack(alignment: .leading, spacing: 0) {
+                        FileCell(url: dest.url, name: dest.name, size: dest.size, date: dest.modified, subtitle: subtitle)
+                        if problem, case .failed(let reason) = status { failure(reason) }
+                    }
                 } else {
                     HStack {
-                        Text(done ? "Not in folder" : (imported ? "Waiting…" : "—"))
-                            .foregroundStyle(done ? Color.red : Color.secondary)
+                        VStack(alignment: .leading, spacing: 3) {
+                            Text(emptyText).foregroundStyle(problem ? Color.red : Color.secondary)
+                            if problem, case .failed(let reason) = status { failure(reason).padding(.horizontal, -14) }
+                        }
                         Spacer()
                     }
                     .padding(.horizontal, 14)
@@ -532,7 +547,21 @@ struct ComparisonRow: View {
             .frame(maxWidth: .infinity, alignment: .leading)
         }
         .frame(height: 116)
-        .background(done && (dest == nil || status?.isVerified != true) ? Color.red.opacity(0.08) : .clear)
+        .background(problem ? Color.red.opacity(0.08) : .clear)
+    }
+
+    /// Why it failed, on the row itself rather than only in a tooltip.
+    private func failure(_ reason: String) -> some View {
+        Text(reason).font(.caption).foregroundStyle(.red).lineLimit(2).padding(.horizontal, 14)
+    }
+
+    private var emptyText: String {
+        switch status {
+        case .notChecked: return done ? "Not checked yet" : "Seems to be in the folder"
+        case .notCopied: return "Not copied yet"
+        case .copying: return "Working on it…"
+        default: return done ? "Not in folder" : (imported ? "Waiting…" : "—")
+        }
     }
 }
 
@@ -610,7 +639,8 @@ struct ComparisonGrid: View {
                                         ForEach(slice) { file in
                                             GridTile(url: file.url, name: file.name, isVideo: file.kind == .video,
                                                      problem: false, missing: false, side: cell,
-                                                     alreadyThere: model.statuses[file.id] == .alreadyThere,
+                                                     badge: model.statuses[file.id] == .alreadyThere ? .confirmed
+                                                         : model.statuses[file.id] == .notChecked ? .unconfirmed : nil,
                                                      version: "\(file.size)|\(file.modified.timeIntervalSince1970)")
                                         }
                                         Spacer(minLength: 0)
@@ -647,8 +677,8 @@ struct ComparisonGrid: View {
             }
             .overlay(alignment: .trailing) {
                 if !imported {
-                    ContentUnavailableView("Not Imported Yet", systemImage: "square.and.arrow.down",
-                                           description: Text("Copies will appear here, lined up with the card."))
+                    ContentUnavailableView(model.emptyPaneText.title, systemImage: "square.and.arrow.down",
+                                           description: Text(model.emptyPaneText.detail))
                         .frame(width: half)
                         .padding(.trailing, margin)
                 }
@@ -664,7 +694,9 @@ struct GridTile: View {
     let problem: Bool
     let missing: Bool
     let side: CGFloat
-    var alreadyThere: Bool = false
+    /// Green check: confirmed in the folder by checksum. Grey: same name and size, not compared yet.
+    enum Badge { case confirmed, unconfirmed }
+    var badge: Badge? = nil
     var empty: Bool = false
     var version: String = ""
 
@@ -688,11 +720,11 @@ struct GridTile: View {
                 }
             }
             .overlay(alignment: .topTrailing) {
-                if alreadyThere {
+                if let badge {
                     // White ring keeps the badge readable on any photo, light or dark.
-                    Image(systemName: "checkmark.circle.fill")
+                    Image(systemName: badge == .confirmed ? "checkmark.circle.fill" : "questionmark.circle.fill")
                         .symbolRenderingMode(.palette)
-                        .foregroundStyle(.white, .green)
+                        .foregroundStyle(.white, badge == .confirmed ? Color.green : Color.gray)
                         .font(.system(size: min(20, max(12, side * 0.16)), weight: .semibold))
                         .background(Circle().fill(.white).padding(1))
                         .shadow(color: .black.opacity(0.35), radius: 1.5, y: 0.5)
@@ -709,6 +741,7 @@ struct GridTile: View {
                 }
             }
             .contentShape(Rectangle())
-            .help(alreadyThere ? "\(name) is already in the folder" : name)
+            .help(badge == .confirmed ? "\(name) is in the folder (same checksum)"
+                  : badge == .unconfirmed ? "\(name) seems to be in the folder (same name and size); not checked yet" : name)
     }
 }

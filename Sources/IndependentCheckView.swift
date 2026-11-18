@@ -119,7 +119,7 @@ struct IndependentCheckSection: View {
         switch check.state {
         case .passed: return "Independent check passed"
         case .missing: return "Independent check found missing files"
-        default: return "The independent check couldn't finish"
+        default: return check.problem?.contains("stopped") == true ? "Check stopped" : "The independent check couldn't finish"
         }
     }
 }

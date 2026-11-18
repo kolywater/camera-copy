@@ -78,7 +78,11 @@ enum Importer {
                 _ = try fm.replaceItemAt(dst, withItemAt: partial)
             } else {
                 // moveItem refuses to overwrite, so a file that appeared meanwhile is never replaced.
-                try fm.moveItem(at: partial, to: dst)
+                do {
+                    try fm.moveItem(at: partial, to: dst)
+                } catch let e as NSError where e.domain == NSCocoaErrorDomain && e.code == NSFileWriteFileExistsError {
+                    throw ImportError.nameTaken(dst.lastPathComponent)
+                }
             }
         } catch {
             try? fm.removeItem(at: partial)

@@ -89,10 +89,21 @@ final class AppModel {
     private(set) var runIsCheckOnly = false
     enum RunStage { case comparing, copying }
     private(set) var runStage: RunStage = .copying
+    /// How many the run compares, and how many it set out to copy.
+    private(set) var runCompareCount = 0
+    private(set) var runCopyCount = 0
     /// Files that matched by name and size but differ, and so were copied as a new "-N" name.
     private(set) var differingCount = 0
     /// Whether this run saved a checksums file (only when it copied something).
     private(set) var manifestWritten = false
+    /// The destination drive filled up during the run; the rest wasn't attempted.
+    private(set) var diskFull = false
+    /// The card was removed while the run was going.
+    private(set) var cardRemovedDuringRun = false
+    /// Card files whose name was taken by a file that appeared mid-import; a retry gives them a new name.
+    @ObservationIgnored private var nameTakenIDs: Set<String> = []
+    /// Card files copied under a "-N" name because a same-name-and-size file in the folder was different.
+    private(set) var differingIDs: Set<String> = []
 
     /// Copies and verifies one file; tests swap in a faulty one to check how bad copies are reported.
     typealias Copier = @Sendable (_ from: URL, _ to: URL, _ size: Int64, _ modified: Date, _ mayReplace: Bool,
@@ -223,8 +234,10 @@ final class AppModel {
         cardFiles.filter { statuses[$0.id]?.isVerified == true && destFiles[$0.id] != nil }.count
     }
 
+    /// Only real failures. Files a stopped run didn't reach are "not finished", not problems.
     func isProblem(_ file: CardFile) -> Bool {
-        guard phase == .done, statuses[file.id] != .notChecked else { return false }
+        guard phase == .done else { return false }
+        if statuses[file.id] == .notChecked || statuses[file.id] == .notCopied { return false }
         return statuses[file.id]?.isSafe != true || destFiles[file.id] == nil
     }
 
@@ -233,20 +246,29 @@ final class AppModel {
     /// Files not compared yet because the check was stopped.
     var notCheckedCount: Int { cardFiles.filter { statuses[$0.id] == .notChecked }.count }
 
-    var canCheckRemaining: Bool {
-        phase == .done && destinationURL != nil && !sourceEjected && notCheckedCount > 0
+    /// Files not copied yet because the import was stopped (or the drive filled up).
+    var notCopiedCount: Int { cardFiles.filter { statuses[$0.id] == .notCopied }.count }
+
+    /// Files a stopped run didn't finish: not checked yet plus not copied yet.
+    var unfinishedCount: Int { notCheckedCount + notCopiedCount }
+
+    var canFinishRemaining: Bool {
+        phase == .done && destinationURL != nil && !sourceEjected && unfinishedCount > 0
     }
 
-    /// Compares the files a stopped check didn't get to. Nothing is copied unless one differs.
-    func checkRemaining() {
-        guard canCheckRemaining, let dest = destinationURL else { return }
-        let rest = cardFiles.filter { statuses[$0.id] == .notChecked }
-        for f in rest { statuses[f.id] = .pending }
-        run([], into: dest, confirming: rest.compactMap { f in alreadyThere[f.id].map { (card: f, folder: candidateLists[f.id] ?? [$0]) } })
+    /// Picks up where a stopped run left off: compares what wasn't checked (copying nothing unless one
+    /// differs) and copies what wasn't copied.
+    func finishRemaining() {
+        guard canFinishRemaining, let dest = destinationURL else { return }
+        let unchecked = cardFiles.filter { statuses[$0.id] == .notChecked }
+        let uncopied = cardFiles.filter { statuses[$0.id] == .notCopied }
+        for f in unchecked + uncopied { statuses[f.id] = .pending }
+        run(uncopied, into: dest,
+            confirming: unchecked.compactMap { f in alreadyThere[f.id].map { (card: f, folder: candidateLists[f.id] ?? [$0]) } })
     }
 
     var allVerified: Bool {
-        phase == .done && !wasCancelled && !cardFiles.isEmpty && problemCount == 0
+        phase == .done && !wasCancelled && !cardFiles.isEmpty && problemCount == 0 && unfinishedCount == 0
     }
 
     // MARK: - Source
@@ -309,6 +331,7 @@ final class AppModel {
 
     private func markSourceEjected() {
         sourceEjected = true
+        if phase == .importing { cardRemovedDuringRun = true }
         // Keep a finished import on screen as a record; otherwise there's nothing left to show.
         if phase == .ready || phase == .scanning || phase == .idle {
             cardFiles = []
@@ -382,7 +405,7 @@ final class AppModel {
             for i in cardFiles.indices { cardFiles[i].destName = scannedDestNames[cardFiles[i].id] ?? cardFiles[i].name }
             alreadyThere = [:]
             candidateLists = [:]
-            if phase == .ready { for f in cardFiles where statuses[f.id] == .alreadyThere { statuses[f.id] = .pending } }
+            if phase == .ready { for f in cardFiles where statuses[f.id] == .notChecked { statuses[f.id] = .pending } }
             done?(nil)
             return
         }
@@ -413,7 +436,8 @@ final class AppModel {
         alreadyThere = plan.alreadyThere
         candidateLists = plan.candidates
         if phase == .ready {
-            for f in cardFiles { statuses[f.id] = plan.alreadyThere[f.id] != nil ? .alreadyThere : .pending }
+            // Grey until the checksums are compared; green only once confirmed.
+            for f in cardFiles { statuses[f.id] = plan.alreadyThere[f.id] != nil ? .notChecked : .pending }
         }
     }
 
@@ -590,9 +614,20 @@ final class AppModel {
         guard canRetry, let dest = destinationURL else { return }
         let failed = cardFiles.filter(isProblem)
         for f in failed { statuses[f.id] = .pending }
+        // A file whose name was taken by someone else's file mid-import gets a new free name in the top folder.
+        let topNames = Set(((try? FileManager.default.contentsOfDirectory(atPath: dest.path)) ?? []).map { $0.lowercased() })
+        var taken = topNames.union(cardFiles.map { $0.destName.lowercased() })
+        for i in cardFiles.indices where nameTakenIDs.contains(cardFiles[i].id) && failed.contains(where: { $0.id == cardFiles[i].id }) {
+            let name = ExistingFolder.freeName(cardFiles[i].name, taken: taken)
+            taken.insert(name.lowercased())
+            cardFiles[i].destName = name
+        }
+        nameTakenIDs = []
+        let failedIDs = Set(failed.map(\.id))
+        let refreshed = cardFiles.filter { failedIDs.contains($0.id) }
         // A file that was only a same-name-and-size candidate is compared again, never copied over.
-        let candidates = failed.compactMap { f in alreadyThere[f.id].map { (card: f, folder: candidateLists[f.id] ?? [$0]) } }
-        run(failed.filter { alreadyThere[$0.id] == nil }, into: dest, confirming: candidates)
+        let candidates = refreshed.compactMap { f in alreadyThere[f.id].map { (card: f, folder: candidateLists[f.id] ?? [$0]) } }
+        run(refreshed.filter { alreadyThere[$0.id] == nil }, into: dest, confirming: candidates)
     }
 
     /// Copies `files` into `dest`. First, each of `candidates` (a card file and the folder files, anywhere
@@ -606,9 +641,13 @@ final class AppModel {
             + candidates.reduce(0) { $0 + $1.card.size } * 2  // read the card file + read the folder file
         runCount = files.count + candidates.count
         runIsCheckOnly = files.isEmpty && !candidates.isEmpty
+        runCompareCount = candidates.count
+        runCopyCount = files.count
         runStage = candidates.isEmpty ? .copying : .comparing
         differingCount = 0
         manifestWritten = false
+        diskFull = false
+        cardRemovedDuringRun = false
         timeLeftText = "Estimating…"
         currentIndex = 0
         wasCancelled = false
@@ -717,8 +756,10 @@ final class AppModel {
                 }
             }
             let differ = renamed.count
+            let differIDs = Set(renamed.map(\.id))
             await MainActor.run {
                 self.differingCount = differ
+                self.differingIDs.formUnion(differIDs)
                 self.runStage = .copying
             }
             let toCopy = files + renamed
@@ -756,7 +797,15 @@ final class AppModel {
                         status = .failed("Checksum mismatch: the copy differs from the card")
                     }
                 } catch is CancellationError {
-                    status = .failed("Cancelled")
+                    status = .notCopied
+                } catch Importer.ImportError.nameTaken(let name) {
+                    status = .failed(Importer.ImportError.nameTaken(name).localizedDescription)
+                    let id = file.id
+                    await MainActor.run { _ = self.nameTakenIDs.insert(id) }
+                } catch where Self.isDiskFull(error) {
+                    // Nothing more will fit: stop here, and leave this file and the rest as "not copied yet".
+                    await MainActor.run { self.diskFull = true; self.statuses[file.id] = .notCopied }
+                    break
                 } catch {
                     status = .failed(error.localizedDescription)
                 }
@@ -802,17 +851,18 @@ final class AppModel {
         var expected = Set<String>()
         var found: [String: DestFile] = [:]
 
-        // Files a stopped run never got to compare are "not checked yet", not failures.
-        if cancelled {
-            for file in cardFiles where alreadyThere[file.id] != nil {
+        // Files a stopped run never reached are "not checked yet" or "not copied yet", never failures.
+        if cancelled || diskFull {
+            for file in cardFiles {
                 switch statuses[file.id] {
-                case .pending, .copying, .failed("Cancelled"): statuses[file.id] = .notChecked
+                case .pending, .copying, .failed("Cancelled"):
+                    statuses[file.id] = alreadyThere[file.id] != nil ? .notChecked : .notCopied
                 default: break
                 }
             }
         }
         for file in cardFiles {
-            if statuses[file.id] == .notChecked { continue }
+            if statuses[file.id] == .notChecked || statuses[file.id] == .notCopied { continue }
             // Confirmed already there, possibly in a subfolder: look at that very file again.
             if statuses[file.id] == .alreadyThere, let match = alreadyThere[file.id] {
                 guard let d = Importer.destFile(at: match.url) else {
@@ -858,7 +908,20 @@ final class AppModel {
         NSWorkspace.shared.activateFileViewerSelecting([destinationURL])
     }
 
+    /// The destination ran out of space.
+    nonisolated static func isDiskFull(_ error: Error) -> Bool {
+        let e = error as NSError
+        if e.domain == NSCocoaErrorDomain && e.code == NSFileWriteOutOfSpaceError { return true }
+        if e.domain == NSPOSIXErrorDomain && e.code == Int(ENOSPC) { return true }
+        if let underlying = e.userInfo[NSUnderlyingErrorKey] as? Error { return isDiskFull(underlying) }
+        return false
+    }
+
     func ejectCard() {
+        guard independentCheck.state != .missing else {
+            alertMessage = "The independent check found files missing from the folder. Keep the card until they're copied."
+            return
+        }
         guard !independentCheck.isRunning else {
             alertMessage = "The independent check is still reading the card. Stop it or wait for it to finish, then eject."
             return

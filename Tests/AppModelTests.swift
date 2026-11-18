@@ -117,7 +117,8 @@ final class AppModelTests: TempDirTestCase {
         XCTAssertNil(m.existingFolderError)
         XCTAssertEqual(m.alreadyThere.count, 3)
         XCTAssertEqual(m.filesToCopyCount, 2)
-        XCTAssertEqual(m.statuses.values.filter { $0 == .alreadyThere }.count, 3, "drives the grid checkmarks")
+        XCTAssertEqual(m.statuses.values.filter { $0 == .notChecked }.count, 3, "grey 'seems to be there' until checked")
+        XCTAssertEqual(m.statuses.values.filter { $0 == .alreadyThere }.count, 0, "nothing is green before its checksum is compared")
         XCTAssertEqual(m.existingFolderDisplayName, "Shoot")
 
         m.startImport()
@@ -560,6 +561,179 @@ final class AppModelTests: TempDirTestCase {
         try await wait(m, for: .done)
         XCTAssertTrue(m.wasCancelled)
         XCTAssertFalse(m.allVerified)
+        XCTAssertEqual(m.problemCount, 0, "stopping isn't a failure")
+        XCTAssertEqual(m.notCopiedCount, 5)
+    }
+
+    // MARK: Every state from Aiden's point of view (marlowe's UI audit)
+
+    /// #23: stopping a normal import is calm and neutral, and Copy Remaining finishes it.
+    func testStoppedImportIsNeutralAndCanBeFinished() async throws {
+        try makeCard()
+        let m = try await readyModel()
+        m.hasher = { try Importer.hashFile($0, cancel: $1, progress: $2) }
+        let real = m.copier
+        m.copier = { from, to, size, modified, mayReplace, cancel, progress in
+            Thread.sleep(forTimeInterval: 0.2)
+            return try real(from, to, size, modified, mayReplace, cancel, progress)
+        }
+        m.folderName = "Shoot"
+        m.startImport()
+        while m.currentIndex < 3 { try await Task.sleep(for: .milliseconds(5)) }
+        m.cancelImport()
+        try await wait(m, for: .done)
+        XCTAssertEqual(m.problemCount, 0)
+        XCTAssertGreaterThan(m.notCopiedCount, 0)
+        XCTAssertTrue(m.cardFiles.allSatisfy { !m.isProblem($0) }, "nothing red")
+        XCTAssertEqual(m.resultTone, .stopped)
+        XCTAssertEqual(m.resultTitle, "Import stopped")
+        XCTAssertEqual(m.resultDetail, "\(m.verifiedCount) copied and verified. \(m.notCopiedCount) not copied yet. Keep the card until it's finished.")
+        XCTAssertEqual(m.finishButtonTitle, "Copy Remaining \(m.notCopiedCount)")
+        m.copier = real
+        m.finishRemaining()
+        try await wait(m, for: .done)
+        XCTAssertTrue(m.allVerified)
+        XCTAssertEqual(m.resultTitle, "All 5 files verified")
+    }
+
+    /// #28: the drive filling up is one clear line, the rest is "not copied yet", and it can be finished.
+    func testDiskFullStopsWithOneClearMessage() async throws {
+        try makeCard()
+        let m = try await readyModel()
+        let real = m.copier
+        let calls = Counter()
+        m.copier = { from, to, size, modified, mayReplace, cancel, progress in
+            calls.add(from.lastPathComponent)
+            if calls.count == 3 { throw CocoaError(.fileWriteOutOfSpace) }
+            return try real(from, to, size, modified, mayReplace, cancel, progress)
+        }
+        m.folderName = "Shoot"
+        m.startImport()
+        try await wait(m, for: .done)
+        XCTAssertEqual(calls.count, 3, "it stops trying once the drive is full")
+        XCTAssertTrue(m.diskFull)
+        XCTAssertEqual(m.problemCount, 0)
+        XCTAssertEqual(m.notCopiedCount, 3)
+        XCTAssertEqual(m.resultTone, .attention)
+        XCTAssertEqual(m.resultTitle, "The destination drive is full")
+        XCTAssertEqual(m.resultDetail, "2 copied and verified. 3 not copied yet. Free up space on the drive, then choose Copy Remaining 3.")
+        m.copier = real
+        m.finishRemaining()
+        try await wait(m, for: .done)
+        XCTAssertTrue(m.allVerified)
+    }
+
+    /// #18, #19: "already there" rows are never tinted red after a good run, and the words fit.
+    func testAlreadyThereIsNeverAProblem() async throws {
+        try makeCard()
+        let shoot = out.appendingPathComponent("Shoot")
+        try FileManager.default.createDirectory(at: shoot.appendingPathComponent("old"), withIntermediateDirectories: true)
+        try FileManager.default.copyItem(at: card.appendingPathComponent("PRIVATE/M4ROOT/CLIP/C0001.MP4"), to: shoot.appendingPathComponent("old/C0001.MP4"))
+        let m = try await readyModel()
+        try await chooseExisting(m, shoot)
+        m.startImport()
+        try await wait(m, for: .done)
+        XCTAssertTrue(m.allVerified)
+        XCTAssertTrue(m.cardFiles.allSatisfy { !m.isProblem($0) })
+        XCTAssertEqual(m.resultTitle, "4 copied, 1 already there")
+        XCTAssertTrue(m.resultDetail.hasPrefix("The 4 copies match two separate reads of the card; the 1 already there have the same checksum as the card."), m.resultDetail)
+        let clip = try XCTUnwrap(m.cardFiles.first { $0.name == "C0001.MP4" })
+        XCTAssertEqual(m.rowSubtitle(clip, try XCTUnwrap(m.destFiles[clip.id])), "already in the folder as old/C0001.MP4")
+    }
+
+    /// #22 (part 2): a stopped check never calls a subfolder candidate "Not in folder".
+    func testStoppedSubfolderCandidateIsNotCheckedNotMissing() async throws {
+        try makeCard()
+        let shoot = out.appendingPathComponent("Shoot")
+        for f in try CardScanner.scan(root: card).media {
+            let sub = shoot.appendingPathComponent("year/\(f.destName)")
+            try FileManager.default.createDirectory(at: sub.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try FileManager.default.copyItem(at: f.url, to: sub)
+        }
+        let m = try await readyModel()
+        try await chooseExisting(m, shoot)
+        m.hasher = slowHasher(0.3)
+        m.startImport()
+        while m.currentIndex < 2 { try await Task.sleep(for: .milliseconds(5)) }
+        m.cancelImport()
+        try await wait(m, for: .done)
+        XCTAssertEqual(m.problemCount, 0)
+        XCTAssertTrue(m.cardFiles.allSatisfy { m.statuses[$0.id] == .alreadyThere || m.statuses[$0.id] == .notChecked })
+    }
+
+    /// #33: a name taken mid-import gets a fresh name on Retry, and the other file is untouched.
+    func testRetryAfterANameWasTakenUsesANewName() async throws {
+        try makeCard()
+        let m = try await readyModel()
+        let real = m.copier
+        m.copier = copierWithIntruder(on: "C0001.MP4", contents: "theirs")
+        m.folderName = "Shoot"
+        m.startImport()
+        try await wait(m, for: .done)
+        XCTAssertEqual(m.problemCount, 1)
+        XCTAssertEqual(m.resultTitle, "1 file has a problem")
+        m.copier = real
+        m.retryFailed()
+        try await wait(m, for: .done)
+        XCTAssertTrue(m.allVerified)
+        let shoot = out.appendingPathComponent("Shoot")
+        XCTAssertEqual(try String(contentsOf: shoot.appendingPathComponent("C0001.MP4"), encoding: .utf8), "theirs")
+        XCTAssertTrue(try names(in: shoot).contains("C0001-2.MP4"))
+    }
+
+    /// #30: a card removed after an unfinished run says to keep it, without calling it a failed import.
+    func testCardRemovedAfterAStoppedRunSaysKeepTheCard() async throws {
+        try makeCard()
+        let m = try await readyModel()
+        m.folderName = "Shoot"
+        m.startImport()
+        m.cancelImport()
+        try await wait(m, for: .done)
+        m.sourceEjected = true
+        let unconfirmed = 5 - m.verifiedCount
+        XCTAssertEqual(m.ejectedDetail, "Card removed. \(unconfirmed) \(unconfirmed == 1 ? "file wasn't" : "files weren't") confirmed, so keep the card.")
+        XCTAssertFalse(m.canFinishRemaining, "finishing needs the card back")
+    }
+
+    /// #40: Eject waits when the independent check found missing files.
+    func testEjectIsHeldBackByARedIndependentCheck() async throws {
+        try makeCard()
+        let m = try await readyModel()
+        let script = tmp.appendingPathComponent("red.sh")
+        try Data("echo 'MISSING: x'; exit 1\n".utf8).write(to: script)
+        m.independentCheck = IndependentCheck(scriptURL: script)
+        m.folderName = "Shoot"
+        m.startImport()
+        try await wait(m, for: .done)
+        m.runIndependentCheckOnLastImport()
+        while m.independentCheck.isRunning { try await Task.sleep(for: .milliseconds(10)) }
+        XCTAssertEqual(m.independentCheck.state, .missing)
+        m.ejectCard()
+        XCTAssertTrue(m.alertMessage?.contains("independent check found files missing") == true)
+        XCTAssertFalse(m.sourceEjected)
+    }
+
+    /// #7, #9, #10, #11: the words before a run, and nothing green before a checksum.
+    func testWordsBeforeARun() async throws {
+        try makeCard()
+        let m = try await readyModel()
+        m.destinationMode = .existingFolder
+        XCTAssertTrue(m.existingFolderHint.contains("or its subfolders"))
+        let empty = out.appendingPathComponent("Empty")
+        try FileManager.default.createDirectory(at: empty, withIntermediateDirectories: true)
+        try await chooseExisting(m, empty)
+        XCTAssertEqual(m.existingFolderSummary, "None of the card's files are in this folder yet.")
+        XCTAssertEqual(m.emptyPaneText.title, "Not Imported Yet")
+        let some = out.appendingPathComponent("Some")
+        try FileManager.default.createDirectory(at: some, withIntermediateDirectories: true)
+        try FileManager.default.copyItem(at: card.appendingPathComponent("PRIVATE/M4ROOT/CLIP/C0001.MP4"), to: some.appendingPathComponent("C0001.MP4"))
+        try await chooseExisting(m, some)
+        XCTAssertEqual(m.existingFolderSummary, "4 new files to copy. 1 more seem to be in the folder already; they'll be confirmed by checksum.")
+        XCTAssertFalse(m.statuses.values.contains(.alreadyThere), "no green before the checksum")
+        let all = try folderWithEverything()
+        try await chooseExisting(m, all)
+        XCTAssertTrue(m.existingFolderSummary.hasPrefix("All 5 files seem to be in the folder (same name and size)."))
+        XCTAssertEqual(m.emptyPaneText.title, "Not Checked Yet")
     }
 
     func testMissingSourceShowsAScanError() async throws {
@@ -631,7 +805,7 @@ final class AppModelTests: TempDirTestCase {
         let m = try await readyModel()
         try await chooseExisting(m, shoot)
         XCTAssertEqual(m.importButtonTitle, "Check 5 Files Are Identical")
-        XCTAssertTrue(m.existingFolderSummary.contains("copies nothing unless one differs"), m.existingFolderSummary)
+        XCTAssertTrue(m.existingFolderSummary.contains("nothing is copied unless one differs"), m.existingFolderSummary)
         XCTAssertFalse(m.existingFolderSummary.contains("Import"))
 
         m.hasher = slowHasher(0.15)
@@ -669,13 +843,14 @@ final class AppModelTests: TempDirTestCase {
         XCTAssertEqual(m.resultTone, .stopped)
         let confirmed = m.alreadyThereCount
         XCTAssertEqual(m.resultTitle, "Stopped: \(confirmed) of 5 confirmed identical")
-        XCTAssertEqual(m.resultDetail, "\(m.notCheckedCount) not checked. Nothing was copied.")
+        XCTAssertEqual(m.resultDetail, "\(m.notCheckedCount) not checked. Nothing was copied. Keep the card until it's finished.")
+        XCTAssertEqual(m.finishButtonTitle, "Finish Checking (\(m.notCheckedCount))")
         XCTAssertFalse(m.resultTitle.contains("mport") || m.resultDetail.contains("wipe"))
         XCTAssertEqual(try snapshot(shoot), before, "stopping leaves the folder exactly as it was")
 
         m.hasher = { try Importer.hashFile($0, cancel: $1, progress: $2) }
-        XCTAssertTrue(m.canCheckRemaining)
-        m.checkRemaining()
+        XCTAssertTrue(m.canFinishRemaining)
+        m.finishRemaining()
         try await wait(m, for: .done)
         XCTAssertEqual(m.resultTitle, "All 5 already in the folder, identical")
         XCTAssertEqual(try snapshot(shoot), before)
