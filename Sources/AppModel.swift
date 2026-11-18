@@ -71,6 +71,17 @@ final class AppModel {
     @ObservationIgnored private var scannedDestNames: [String: String] = [:]
     /// Every name in the destination folder before this import started. Those files are never replaced.
     @ObservationIgnored private var preexistingNames: Set<String> = []
+    /// Copies this import wrote that then failed verification: target path (lowercased) -> the file's
+    /// identity (device and inode). Only these may be replaced by a retry. Anything else at a target,
+    /// including a file that appears there mid-import, is never replaced: that copy fails as "name taken".
+    @ObservationIgnored private var ownBadCopies: [String: String] = [:]
+
+    /// Device and inode, which change when a file is replaced by another one.
+    nonisolated static func fileIdentity(_ url: URL) -> String? {
+        guard let a = try? FileManager.default.attributesOfItem(atPath: url.path),
+              let dev = a[.systemNumber], let ino = a[.systemFileNumber] else { return nil }
+        return "\(dev):\(ino)"
+    }
     @ObservationIgnored private(set) var manifestFileName = Importer.manifestName
     /// How many files the running import (or retry) copies.
     var runCount = 0
@@ -156,6 +167,9 @@ final class AppModel {
         existingFolderPath.isEmpty ? "Choose…" : FileManager.default.displayName(atPath: existingFolderPath)
     }
 
+    /// The chosen folder with any symlinks resolved, so it's searched and checked as the real folder.
+    var existingFolderURL: URL { URL(fileURLWithPath: existingFolderPath).resolvingSymlinksInPath() }
+
     var existingFolderError: String? {
         if existingFolderPath.isEmpty { return "Choose a folder" }
         var isDir: ObjCBool = false
@@ -184,8 +198,8 @@ final class AppModel {
     /// Whether `path` is `folder` or inside it, ignoring letter case as Mac disks usually do.
     static func isInside(_ path: String, _ folder: String) -> Bool {
         guard !path.isEmpty, !folder.isEmpty else { return false }
-        let p = URL(fileURLWithPath: path).standardizedFileURL.path.lowercased()
-        let f = URL(fileURLWithPath: folder).standardizedFileURL.path.lowercased()
+        let p = URL(fileURLWithPath: path).resolvingSymlinksInPath().standardizedFileURL.path.lowercased()
+        let f = URL(fileURLWithPath: folder).resolvingSymlinksInPath().standardizedFileURL.path.lowercased()
         return p == f || p.hasPrefix(f == "/" ? "/" : f + "/")
     }
 
@@ -317,7 +331,7 @@ final class AppModel {
         panel.prompt = "Add to This Folder"
         panel.message = "Choose a folder. Files already in it are skipped, and nothing in it is replaced."
         if panel.runModal() == .OK, let url = panel.url {
-            existingFolderPath = url.path
+            existingFolderPath = url.resolvingSymlinksInPath().path
             destinationChanged()
         }
     }
@@ -352,15 +366,16 @@ final class AppModel {
         searchGeneration += 1
         let generation = searchGeneration
         searchingFolder = true
-        let folder = URL(fileURLWithPath: existingFolderPath)
-        let card = sourcePath.isEmpty ? nil : URL(fileURLWithPath: sourcePath)
+        let folder = existingFolderURL
+        let card = sourcePath.isEmpty ? nil : URL(fileURLWithPath: sourcePath).resolvingSymlinksInPath()
         let media = cardFiles
         Task.detached(priority: .userInitiated) {
             let listing = ExistingFolder.list(folder, excluding: card)
             let plan = ExistingFolder.plan(media, listing: listing)
             await MainActor.run {
-                guard generation == self.searchGeneration, self.cardFiles.map(\.id) == media.map(\.id) else { return }
+                guard generation == self.searchGeneration else { return }   // a newer search is running
                 self.searchingFolder = false
+                guard self.cardFiles.map(\.id) == media.map(\.id) else { return }       // the card changed: drop it
                 self.apply(plan, listing: listing)
                 done?(listing)
             }
@@ -437,6 +452,8 @@ final class AppModel {
                     self.planDestination()
                 case .failure(let e):
                     self.scanError = e.localizedDescription
+                    self.searchGeneration += 1          // any folder search for the old card no longer applies
+                    self.searchingFolder = false
                     self.phase = .idle
                 }
             }
@@ -495,6 +512,7 @@ final class AppModel {
         for f in cardFiles { statuses[f.id] = .pending }
         destinationURL = dest
         preexistingNames = []
+        ownBadCopies = [:]
         manifestFileName = Importer.manifestName
         run(cardFiles, into: dest)
     }
@@ -518,7 +536,7 @@ final class AppModel {
 
     private func beginImportIntoExisting(_ listing: ExistingFolder.Listing) {
         guard phase == .ready || phase == .done else { return }
-        let dest = URL(fileURLWithPath: existingFolderPath)
+        let dest = existingFolderURL
         // Same name and size is only a candidate: run() compares checksums before calling it "already there".
         let toCopy = cardFiles.filter { alreadyThere[$0.id] == nil }
         let candidates = cardFiles.compactMap { f in alreadyThere[f.id].map { (card: f, folder: candidateLists[f.id] ?? [$0]) } }
@@ -535,6 +553,7 @@ final class AppModel {
         for f in cardFiles { statuses[f.id] = .pending }
         destinationURL = dest
         preexistingNames = listing.takenNames
+        ownBadCopies = [:]
         manifestFileName = Importer.newManifestName(taken: listing.takenNames)
         run(toCopy, into: dest, confirming: candidates)
     }
@@ -683,12 +702,20 @@ final class AppModel {
                 }
 
                 let target = dest.appendingPathComponent(file.destName)
+                let key = target.path.lowercased()
+                // Replace only this import's own failed copy, and only if it's still that very file.
+                let mayReplace: Bool = await MainActor.run {
+                    guard let mine = self.ownBadCopies[key] else { return false }
+                    return Self.fileIdentity(target) == mine
+                }
                 let status: VerifyStatus
                 do {
-                    let r = try copier(file.url, target, file.size, file.modified,
-                                       !preexisting.contains(file.destName.lowercased()), token) { n in
+                    let r = try copier(file.url, target, file.size, file.modified, mayReplace, token) { n in
                         Task { @MainActor in self.bytesDone += n }
                     }
+                    // The copy at `target` is this import's own; remember it if it failed so a retry may replace it.
+                    let identity = r.allMatch ? nil : Self.fileIdentity(target)
+                    await MainActor.run { self.ownBadCopies[key] = identity }
                     if r.allMatch {
                         status = .verified(hash: r.destHash)
                     } else if r.sourceHash != r.sourceRereadHash {

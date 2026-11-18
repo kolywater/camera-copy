@@ -32,8 +32,9 @@ enum Importer {
     /// Copies `src` to `dst`, hashing the card bytes as they're read, and flushing the copy all the way
     /// to disk. Then it re-reads the copy from disk and re-reads the card, each bypassing the cache, and
     /// hashes both separately. A bad read from the card shows up as a mismatch, not a "verified" copy.
-    /// With `mayReplace` false, an existing file at `dst` is never touched: the copy fails instead.
-    static func copyAndVerify(from src: URL, to dst: URL, expectedSize: Int64, modified: Date, mayReplace: Bool = true,
+    /// An existing file at `dst` is never touched unless `mayReplace` (Camera Copy's own failed copy,
+    /// on a retry): the copy fails instead.
+    static func copyAndVerify(from src: URL, to dst: URL, expectedSize: Int64, modified: Date, mayReplace: Bool = false,
                               cancel: CancelToken, progress: (Int64) -> Void) throws -> CopyResult {
         let fm = FileManager.default
         if !mayReplace, fm.fileExists(atPath: dst.path) { throw ImportError.nameTaken(dst.lastPathComponent) }

@@ -328,6 +328,139 @@ final class AppModelTests: TempDirTestCase {
         XCTAssertEqual(m.bytesDone, m.bytesTotal, "progress reaches the end with the cheaper comparison")
     }
 
+    // MARK: Never overwrite (marlowe #8)
+
+    /// A copier that, partway through copying `name`, has someone else's file appear at the target.
+    private func copierWithIntruder(on name: String, contents: String) -> AppModel.Copier {
+        { from, to, size, modified, mayReplace, cancel, progress in
+            var appeared = false
+            return try Importer.copyAndVerify(from: from, to: to, expectedSize: size, modified: modified,
+                                              mayReplace: mayReplace, cancel: cancel) { n in
+                if from.lastPathComponent == name, !appeared {
+                    appeared = true
+                    try? Data(contents.utf8).write(to: to)
+                }
+                progress(n)
+            }
+        }
+    }
+
+    func testAFileAppearingMidImportUnderTheChosenNameSurvives() async throws {
+        try makeCard()
+        let m = try await readyModel()
+        m.copier = copierWithIntruder(on: "C0001.MP4", contents: "another shooter's clip")
+        m.folderName = "Shoot"
+        m.startImport()
+        try await wait(m, for: .done)
+        let theirs = out.appendingPathComponent("Shoot/C0001.MP4")
+        XCTAssertEqual(try String(contentsOf: theirs, encoding: .utf8), "another shooter's clip", "never overwritten")
+        XCTAssertFalse(m.allVerified)
+        XCTAssertEqual(m.problemCount, 1, "it fails visibly instead")
+        XCTAssertEqual(m.verifiedCount, 4)
+    }
+
+    func testAFileAppearingMidImportInAnExistingFolderSurvives() async throws {
+        try makeCard()
+        let shoot = out.appendingPathComponent("Shoot")
+        try FileManager.default.createDirectory(at: shoot, withIntermediateDirectories: true)
+        let m = try await readyModel()
+        m.copier = copierWithIntruder(on: "C0001.MP4", contents: "synced in")
+        m.existingFolderPath = shoot.path
+        m.destinationMode = .existingFolder
+        try await searched(m)
+        m.startImport()
+        try await wait(m, for: .done)
+        XCTAssertEqual(try String(contentsOf: shoot.appendingPathComponent("C0001.MP4"), encoding: .utf8), "synced in")
+        XCTAssertEqual(m.problemCount, 1)
+    }
+
+    func testRetryReplacesOnlyItsOwnBadCopy() async throws {
+        try makeCard()
+        let m = try await readyModel()
+        let real = m.copier
+        // First attempt: the JPG copy comes out corrupt (reported by the verify step).
+        m.copier = { from, to, size, modified, mayReplace, cancel, progress in
+            let r = try real(from, to, size, modified, mayReplace, cancel, progress)
+            if from.path.hasSuffix("100MSDCF/DSC00001.JPG") {
+                try Data("garbage".utf8).write(to: to)
+                return .init(sourceHash: r.sourceHash, sourceRereadHash: r.sourceHash, destHash: "garbage")
+            }
+            return r
+        }
+        m.folderName = "Shoot"
+        m.startImport()
+        try await wait(m, for: .done)
+        XCTAssertEqual(m.problemCount, 1)
+        let target = out.appendingPathComponent("Shoot/DSC00001.JPG")
+        m.copier = real
+        m.retryFailed()
+        try await wait(m, for: .done)
+        XCTAssertTrue(m.allVerified, "its own bad copy may be replaced")
+        let jpg = try XCTUnwrap(m.cardFiles.first { $0.relativePath == "DCIM/100MSDCF/DSC00001.JPG" })
+        XCTAssertEqual(try Data(contentsOf: target), try Data(contentsOf: jpg.url))
+    }
+
+    func testRetryNeverReplacesAFileSomeoneElsePutThere() async throws {
+        try makeCard()
+        let m = try await readyModel()
+        let real = m.copier
+        m.copier = { from, to, size, modified, mayReplace, cancel, progress in
+            let r = try real(from, to, size, modified, mayReplace, cancel, progress)
+            return from.path.hasSuffix("100MSDCF/DSC00001.JPG")
+                ? .init(sourceHash: r.sourceHash, sourceRereadHash: r.sourceHash, destHash: "bad") : r
+        }
+        m.folderName = "Shoot"
+        m.startImport()
+        try await wait(m, for: .done)
+        // Someone replaces the bad copy with their own file before the retry.
+        let target = out.appendingPathComponent("Shoot/DSC00001.JPG")
+        try FileManager.default.removeItem(at: target)
+        try Data("someone else's".utf8).write(to: target)
+        m.copier = real
+        m.retryFailed()
+        try await wait(m, for: .done)
+        XCTAssertEqual(try String(contentsOf: target, encoding: .utf8), "someone else's", "a different file is never replaced")
+        XCTAssertFalse(m.allVerified)
+    }
+
+    // MARK: Symlinked folder (#9) and a stuck search (#10)
+
+    func testAFolderChosenThroughASymlinkIsTheRealFolder() async throws {
+        try makeCard()
+        let shoot = out.appendingPathComponent("Shoot")
+        try FileManager.default.createDirectory(at: shoot.appendingPathComponent("old"), withIntermediateDirectories: true)
+        try FileManager.default.copyItem(at: card.appendingPathComponent("PRIVATE/M4ROOT/CLIP/C0001.MP4"),
+                                         to: shoot.appendingPathComponent("old/C0001.MP4"))
+        let link = tmp.appendingPathComponent("Link to Shoot")
+        try FileManager.default.createSymbolicLink(at: link, withDestinationURL: shoot)
+        let m = try await readyModel()
+        m.existingFolderPath = link.path
+        m.destinationMode = .existingFolder
+        try await searched(m)
+        XCTAssertEqual(m.alreadyThere.count, 1, "the real folder is searched")
+        m.startImport()
+        try await wait(m, for: .done)
+        XCTAssertTrue(m.allVerified, "new copies aren't reported missing: \(m.statuses)")
+        XCTAssertEqual(m.verifiedCount, 4)
+    }
+
+    func testAFailedCardScanDoesNotLeaveTheSearchSpinning() async throws {
+        try makeCard()
+        let shoot = out.appendingPathComponent("Shoot")
+        for i in 0..<3000 { try makeFile("many/F\(i).JPG", size: 1, in: shoot) }
+        let m = try await readyModel()
+        m.existingFolderPath = shoot.path
+        m.destinationMode = .existingFolder
+        XCTAssertTrue(m.searchingFolder)
+        m.sourcePath = tmp.appendingPathComponent("unplugged").path
+        m.scanSource()
+        let deadline = Date().addingTimeInterval(10)
+        while m.scanError == nil && Date() < deadline { try await Task.sleep(for: .milliseconds(10)) }
+        XCTAssertNotNil(m.scanError)
+        try await Task.sleep(for: .milliseconds(500))
+        XCTAssertFalse(m.searchingFolder, "the spinner stops once the card can't be read")
+    }
+
     func testAComparisonThatFailsCanBeRetried() async throws {
         try makeCard()
         let shoot = out.appendingPathComponent("Shoot")
