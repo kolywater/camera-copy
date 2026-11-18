@@ -240,6 +240,7 @@ struct Sidebar: View {
         guard model.destinationMode == .existingFolder, model.existingFolderError == nil else {
             return "Import \(Format.count(model.cardFiles.count)) Files"
         }
+        if model.searchingFolder { return "Searching the Folder…" }
         let n = model.filesToCopyCount
         if n == 0 { return "Confirm \(Format.count(model.alreadyThere.count)) Matching Files" }
         return "Import \(Format.count(n)) New \(n == 1 ? "File" : "Files")"
@@ -269,6 +270,11 @@ struct ExistingFolderNote: View {
                     .foregroundStyle(.secondary)
             } else if let error = model.existingFolderError {
                 Text(error).foregroundStyle(.red)
+            } else if model.searchingFolder {
+                HStack(spacing: 6) {
+                    ProgressView().controlSize(.small)
+                    Text("Searching the folder and its subfolders…").foregroundStyle(.secondary)
+                }
             } else if model.phase == .ready || model.phase == .done {
                 let there = model.alreadyThere.count
                 let new = model.filesToCopyCount

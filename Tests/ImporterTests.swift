@@ -120,6 +120,19 @@ final class ImporterTests: TempDirTestCase {
                        "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
     }
 
+    func testHashPrefixReadsOnlyTheFirstMegabyte() throws {
+        let a = try makeFile("a.bin", size: 1024 * 1024 + 500)
+        var data = try Data(contentsOf: a)
+        data[data.count - 1] ^= 0xFF                         // differs only after the first megabyte
+        let b = tmp.appendingPathComponent("b.bin"); try data.write(to: b)
+        XCTAssertEqual(try Importer.hashPrefix(a), try Importer.hashPrefix(b))
+        data[0] ^= 0xFF                                      // differs in the first byte
+        try data.write(to: b)
+        XCTAssertNotEqual(try Importer.hashPrefix(a), try Importer.hashPrefix(b))
+        let small = try makeFile("small.bin", size: 10)
+        XCTAssertEqual(try Importer.hashPrefix(small), try Data(contentsOf: small).sha256Hex, "a small file is hashed whole")
+    }
+
     func testManifestIsShasumCompatible() throws {
         let a = try makeFile("set/A.JPG"), b = try makeFile("set/B C.ARW")
         let dir = a.deletingLastPathComponent()

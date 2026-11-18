@@ -174,6 +174,29 @@ final class ExistingFolderTests: TempDirTestCase {
         XCTAssertEqual(ExistingFolder.plan(media, listing: listing).alreadyThere.count, 1)
     }
 
+    func testSkipsTheCardIfItIsInsideTheFolderIgnoringCase() throws {
+        try makeFile("CARD/DCIM/DSC9.JPG", size: 100, modified: day(1))
+        let media = try CardScanner.scan(root: card).media
+        let excluded = URL(fileURLWithPath: card.path.uppercased())
+        let listing = ExistingFolder.list(tmp, excluding: excluded)
+        XCTAssertNil(listing.files["dsc9.jpg"], "the card's own files never count as already in the folder")
+        XCTAssertTrue(ExistingFolder.plan(media, listing: listing).alreadyThere.isEmpty)
+        XCTAssertNotNil(ExistingFolder.list(tmp).files["dsc9.jpg"], "(without the exclusion it would match itself)")
+    }
+
+    /// marlowe #6: Photos (or another app) may remove files inside its library later.
+    func testDoesNotLookInsidePackages() throws {
+        try makeFile("CARD/DCIM/DSC9.JPG", size: 100, modified: day(1))
+        let media = try CardScanner.scan(root: card).media
+        try makeFile("Photos Library.photoslibrary/originals/A/DSC9.JPG", size: 100, in: dest)
+        try makeFile("Some.app/Contents/Resources/DSC9.JPG", size: 100, in: dest)
+        let listing = ExistingFolder.list(dest)
+        XCTAssertNil(listing.files["dsc9.jpg"])
+        XCTAssertTrue(ExistingFolder.plan(media, listing: listing).alreadyThere.isEmpty)
+        try makeFile("Ordinary folder/DSC9.JPG", size: 100, in: dest)
+        XCTAssertEqual(ExistingFolder.list(dest).files["dsc9.jpg"]?.count, 1, "ordinary folders are still searched")
+    }
+
     func testFreeName() {
         XCTAssertEqual(ExistingFolder.freeName("DSC1.ARW", taken: []), "DSC1-2.ARW")
         XCTAssertEqual(ExistingFolder.freeName("DSC1.ARW", taken: ["dsc1-2.arw", "dsc1-3.arw"]), "DSC1-4.ARW")

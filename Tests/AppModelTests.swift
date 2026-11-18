@@ -23,6 +23,15 @@ final class AppModelTests: TempDirTestCase {
         }
     }
 
+    /// Waits for the background search of the chosen folder to finish.
+    private func searched(_ m: AppModel, file: StaticString = #filePath, line: UInt = #line) async throws {
+        let deadline = Date().addingTimeInterval(30)
+        while m.searchingFolder {
+            if Date() > deadline { return XCTFail("folder search didn't finish", file: file, line: line) }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+    }
+
     private func readyModel() async throws -> AppModel {
         let m = AppModel()
         m.sourcePath = card.path
@@ -99,10 +108,12 @@ final class AppModelTests: TempDirTestCase {
 
         let m = try await readyModel()
         m.destinationMode = .existingFolder
+        try await searched(m)
         XCTAssertEqual(m.existingFolderError, "Choose a folder")
         XCTAssertFalse(m.canImport)
         m.existingFolderPath = shoot.path
         m.destinationMode = .newFolder; m.destinationMode = .existingFolder     // re-plan with the folder chosen
+        try await searched(m)
         XCTAssertNil(m.existingFolderError)
         XCTAssertEqual(m.alreadyThere.count, 3)
         XCTAssertEqual(m.filesToCopyCount, 2)
@@ -128,6 +139,7 @@ final class AppModelTests: TempDirTestCase {
         let m = try await readyModel()
         m.existingFolderPath = tmp.appendingPathComponent("gone").path
         m.destinationMode = .existingFolder
+        try await searched(m)
         XCTAssertEqual(m.existingFolderError, "That folder isn't there anymore")
         m.existingFolderPath = card.appendingPathComponent("DCIM").path
         XCTAssertEqual(m.existingFolderError, "That folder is on the card")
@@ -139,6 +151,7 @@ final class AppModelTests: TempDirTestCase {
         for f in m.cardFiles { try FileManager.default.copyItem(at: f.url, to: full.appendingPathComponent(f.destName)) }
         m.existingFolderPath = full.path
         m.destinationMode = .newFolder; m.destinationMode = .existingFolder
+        try await searched(m)
         XCTAssertEqual(m.filesToCopyCount, 0)
         XCTAssertTrue(m.canImport, "importing still confirms the matches by checksum")
         m.startImport()
@@ -157,6 +170,7 @@ final class AppModelTests: TempDirTestCase {
         let m = try await readyModel()
         m.existingFolderPath = shoot.path
         m.destinationMode = .existingFolder
+        try await searched(m)
         let card = try XCTUnwrap(m.cardFiles.first { $0.relativePath == "DCIM/100MSDCF/DSC00001.ARW" })
         XCTAssertNotNil(m.alreadyThere[card.id], "by name and size alone it looks the same")
 
@@ -179,6 +193,7 @@ final class AppModelTests: TempDirTestCase {
         let m = try await readyModel()
         m.existingFolderPath = shoot.path
         m.destinationMode = .existingFolder
+        try await searched(m)
         let clip = try XCTUnwrap(m.cardFiles.first { $0.name == "C0001.MP4" })
         XCTAssertEqual(clip.destName, "2024/Day 1/C0001.MP4")
         m.startImport()
@@ -197,6 +212,7 @@ final class AppModelTests: TempDirTestCase {
         let m = try await readyModel()
         m.existingFolderPath = shoot.path
         m.destinationMode = .existingFolder
+        try await searched(m)
         let clip = try XCTUnwrap(m.cardFiles.first { $0.name == "C0001.MP4" })
         XCTAssertNotNil(m.alreadyThere[clip.id])
         m.startImport()
@@ -218,6 +234,7 @@ final class AppModelTests: TempDirTestCase {
         let m = try await readyModel()
         m.existingFolderPath = shoot.path
         m.destinationMode = .existingFolder
+        try await searched(m)
         m.startImport()
         try await wait(m, for: .done)
         let clip = try XCTUnwrap(m.cardFiles.first { $0.name == "C0001.MP4" })
@@ -238,11 +255,77 @@ final class AppModelTests: TempDirTestCase {
         let m = try await readyModel()
         m.existingFolderPath = shoot.path
         m.destinationMode = .existingFolder
+        try await searched(m)
         m.startImport()
         try await wait(m, for: .done)
         XCTAssertTrue(m.allVerified)
         XCTAssertEqual(m.alreadyThereCount, 1)
         XCTAssertEqual(m.verifiedCount, 1, "the second card file is copied, not matched to the same folder file")
+    }
+
+    /// marlowe #5: a card inside the chosen folder would match itself, and nothing would be copied.
+    func testRefusesAFolderThatContainsTheCard() async throws {
+        try makeCard()
+        let m = try await readyModel()
+        for folder in [tmp.path, tmp.path.uppercased(), card.path, card.path.lowercased()] {
+            m.existingFolderPath = folder
+            m.destinationMode = .newFolder; m.destinationMode = .existingFolder
+            try await searched(m)
+            XCTAssertEqual(m.existingFolderError, folder.lowercased() == card.path.lowercased() ? "That folder is on the card"
+                           : "The card is inside that folder. Choose a folder outside the card.", folder)
+            XCTAssertFalse(m.canImport, folder)
+            XCTAssertTrue(m.alreadyThere.isEmpty, "nothing was matched against the card itself")
+        }
+        // A folder next to the card is fine.
+        let beside = out.appendingPathComponent("Beside")
+        try FileManager.default.createDirectory(at: beside, withIntermediateDirectories: true)
+        m.existingFolderPath = beside.path
+        m.destinationMode = .newFolder; m.destinationMode = .existingFolder
+        try await searched(m)
+        XCTAssertNil(m.existingFolderError)
+    }
+
+    func testFolderIsSearchedInTheBackgroundAndImportWaitsForIt() async throws {
+        try makeCard()
+        let shoot = out.appendingPathComponent("Shoot")
+        for i in 0..<2000 { try makeFile("many/\(i % 40)/F\(i).JPG", size: 10, in: shoot) }
+        let m = try await readyModel()
+        m.existingFolderPath = shoot.path
+        m.destinationMode = .existingFolder
+        XCTAssertTrue(m.searchingFolder, "choosing the folder returns at once; the search runs in the background")
+        XCTAssertFalse(m.canImport, "no import until the search is done")
+        try await searched(m)
+        XCTAssertTrue(m.canImport)
+        m.startImport()
+        try await wait(m, for: .done)
+        XCTAssertTrue(m.allVerified)
+        XCTAssertEqual(m.verifiedCount, 5)
+    }
+
+    /// marlowe #7: namesakes (same name and size, different photo) are ruled out by their first megabyte,
+    /// without hashing them in full.
+    func testNamesakesAreRuledOutWithoutFullHashes() async throws {
+        try makeCard()
+        let shoot = out.appendingPathComponent("Shoot")
+        for year in 2010..<2025 { try makeFile("\(year)/C0001.MP4", size: 9000, in: shoot) }   // 15 namesakes
+        let m = try await readyModel()
+        let fullHashes = Counter()
+        m.hasher = { url, cancel, progress in
+            fullHashes.add(url.lastPathComponent)
+            return try Importer.hashFile(url, cancel: cancel, progress: progress)
+        }
+        m.existingFolderPath = shoot.path
+        m.destinationMode = .existingFolder
+        try await searched(m)
+        let clip = try XCTUnwrap(m.cardFiles.first { $0.name == "C0001.MP4" })
+        XCTAssertEqual(m.alreadyThere[clip.id] != nil, true)
+        m.startImport()
+        try await wait(m, for: .done)
+        XCTAssertTrue(m.allVerified)
+        XCTAssertEqual(fullHashes.count, 0, "no namesake shares the first megabyte, so nothing is hashed in full")
+        XCTAssertNotEqual(m.statuses[clip.id], .alreadyThere)
+        XCTAssertTrue(try names(in: shoot).contains("C0001.MP4"), "the clip is copied into the top folder")
+        XCTAssertEqual(m.bytesDone, m.bytesTotal, "progress reaches the end with the cheaper comparison")
     }
 
     func testAComparisonThatFailsCanBeRetried() async throws {
@@ -254,6 +337,7 @@ final class AppModelTests: TempDirTestCase {
         let m = try await readyModel()
         m.existingFolderPath = shoot.path
         m.destinationMode = .existingFolder
+        try await searched(m)
         try shell("/bin/chmod", ["000", cardClip.path])
         m.startImport()
         try await wait(m, for: .done)
@@ -309,6 +393,7 @@ final class AppModelTests: TempDirTestCase {
         try makeFile("DSC00001.ARW", size: 1, in: shoot)           // forces a different name in existing mode
         m.existingFolderPath = shoot.path
         m.destinationMode = .existingFolder
+        try await searched(m)
         XCTAssertNotEqual(m.cardFiles.map(\.destName), scanned)
         m.destinationMode = .newFolder
         XCTAssertEqual(m.cardFiles.map(\.destName), scanned)
@@ -385,4 +470,12 @@ final class AppModelTests: TempDirTestCase {
         for n in try names(in: dir) { r[n] = try Data(contentsOf: dir.appendingPathComponent(n)).sha256Hex }
         return r
     }
+}
+
+/// Thread-safe call counter for fakes.
+final class Counter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var items: [String] = []
+    func add(_ s: String) { lock.lock(); items.append(s); lock.unlock() }
+    var count: Int { lock.lock(); defer { lock.unlock() }; return items.count }
 }

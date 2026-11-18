@@ -35,16 +35,24 @@ enum ExistingFolder {
     /// and folders (which covers ._ files, .DS_Store, .Spotlight-V100, .Trashes, .fseventsd) are skipped,
     /// and symlinked folders aren't followed, so a link can't make it loop. Unreadable subfolders are
     /// skipped too: a file that can't be found there is simply copied again, the safe direction.
-    static func list(_ dir: URL) -> Listing {
+    ///
+    /// Packages (a Photos or Lightroom library, an app) aren't looked inside: their owner app may
+    /// remove those files later, so a photo there doesn't count as already in the folder.
+    /// `excluding` (the card) is skipped with everything in it, so a card inside the folder can never
+    /// match itself. Paths are compared ignoring case, as Mac disks usually do.
+    static func list(_ dir: URL, excluding excluded: URL? = nil) -> Listing {
         let fm = FileManager.default
         let keys: [URLResourceKey] = [.isRegularFileKey, .fileSizeKey, .contentModificationDateKey]
         var taken = Set<String>()
         for name in (try? fm.contentsOfDirectory(atPath: dir.path)) ?? [] { taken.insert(name.lowercased()) }
 
         var found: [DestFile] = []
-        if let walk = fm.enumerator(at: dir, includingPropertiesForKeys: keys, options: [.skipsHiddenFiles],
+        let skip = excluded.map { $0.standardizedFileURL.path.lowercased() }
+        if let walk = fm.enumerator(at: dir, includingPropertiesForKeys: keys,
+                                    options: [.skipsHiddenFiles, .skipsPackageDescendants],
                                     errorHandler: { _, _ in true }) {
             for case let url as URL in walk {
+                if let skip, url.standardizedFileURL.path.lowercased() == skip { walk.skipDescendants(); continue }
                 guard let v = try? url.resourceValues(forKeys: Set(keys)), v.isRegularFile == true else { continue }
                 found.append(DestFile(url: url, name: url.lastPathComponent, size: Int64(v.fileSize ?? 0),
                                       modified: v.contentModificationDate ?? .distantPast))

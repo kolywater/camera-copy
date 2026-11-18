@@ -113,6 +113,15 @@ enum Importer {
         return hex(hasher.finalize())
     }
 
+    /// SHA-256 of just the first `bytes` of a file. Two files whose first megabyte differs can't be the
+    /// same, so this rules out most look-alikes cheaply before a full hash.
+    static func hashPrefix(_ url: URL, bytes: Int = 1024 * 1024) throws -> String {
+        let handle = try FileHandle(forReadingFrom: url)
+        defer { try? handle.close() }
+        _ = fcntl(handle.fileDescriptor, F_NOCACHE, 1)
+        return hex(SHA256.hash(data: try handle.read(upToCount: bytes) ?? Data()))
+    }
+
     /// Lists what is really in the destination folder, keyed by lowercased file name.
     static func listDestination(_ dir: URL) -> [String: DestFile] {
         let keys: [URLResourceKey] = [.isRegularFileKey, .fileSizeKey, .contentModificationDateKey]

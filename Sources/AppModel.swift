@@ -34,6 +34,9 @@ final class AppModel {
     var existingFolderPath = ""
     /// Existing-folder mode: card file id -> the file the folder already has (same name and size).
     var alreadyThere: [String: DestFile] = [:]
+    /// True while the chosen folder (and its subfolders) is being searched, off the main thread.
+    var searchingFolder = false
+    @ObservationIgnored private var searchGeneration = 0
     /// Existing-folder mode: card file id -> every same-name-and-size file anywhere in the folder, best first.
     @ObservationIgnored private var candidateLists: [String: [DestFile]] = [:]
 
@@ -145,7 +148,7 @@ final class AppModel {
         switch destinationMode {
         case .newFolder: return folderNameError == nil
         // Even with nothing new, importing confirms by checksum that the matching files really are the same.
-        case .existingFolder: return existingFolderError == nil
+        case .existingFolder: return existingFolderError == nil && !searchingFolder
         }
     }
 
@@ -160,6 +163,8 @@ final class AppModel {
             return "That folder isn't there anymore"
         }
         if isOnCard(URL(fileURLWithPath: existingFolderPath)) { return "That folder is on the card" }
+        // Otherwise every card file would be found in the folder as itself, and nothing would be copied.
+        if Self.isInside(sourcePath, existingFolderPath) { return "The card is inside that folder. Choose a folder outside the card." }
         return nil
     }
 
@@ -173,10 +178,15 @@ final class AppModel {
     }
 
     private func isOnCard(_ url: URL) -> Bool {
-        guard !sourcePath.isEmpty else { return false }
-        let root = URL(fileURLWithPath: sourcePath).standardizedFileURL.path
-        let p = url.standardizedFileURL.path
-        return p == root || p.hasPrefix(root + "/")
+        Self.isInside(url.path, sourcePath)
+    }
+
+    /// Whether `path` is `folder` or inside it, ignoring letter case as Mac disks usually do.
+    static func isInside(_ path: String, _ folder: String) -> Bool {
+        guard !path.isEmpty, !folder.isEmpty else { return false }
+        let p = URL(fileURLWithPath: path).standardizedFileURL.path.lowercased()
+        let f = URL(fileURLWithPath: folder).standardizedFileURL.path.lowercased()
+        return p == f || p.hasPrefix(f == "/" ? "/" : f + "/")
     }
 
     var folderNameError: String? {
@@ -325,17 +335,39 @@ final class AppModel {
 
     /// Works out which card files the chosen folder already has, and the names new copies get.
     /// Returns the folder listing it used, or nil in new-folder mode.
-    @discardableResult
-    private func planDestination() -> ExistingFolder.Listing? {
+    /// Searches the folder in the background (a big library can take a while), then applies the plan
+    /// and calls `done` with the listing it used, or nil in new-folder mode or if the folder can't be used.
+    /// A newer search, or a different card, makes an older one's result be dropped.
+    private func planDestination(then done: (@MainActor (ExistingFolder.Listing?) -> Void)? = nil) {
         guard destinationMode == .existingFolder, existingFolderError == nil else {
+            searchGeneration += 1
+            searchingFolder = false
             for i in cardFiles.indices { cardFiles[i].destName = scannedDestNames[cardFiles[i].id] ?? cardFiles[i].name }
             alreadyThere = [:]
             candidateLists = [:]
             if phase == .ready { for f in cardFiles where statuses[f.id] == .alreadyThere { statuses[f.id] = .pending } }
-            return nil
+            done?(nil)
+            return
         }
-        let listing = ExistingFolder.list(URL(fileURLWithPath: existingFolderPath))
-        let plan = ExistingFolder.plan(cardFiles, listing: listing)
+        searchGeneration += 1
+        let generation = searchGeneration
+        searchingFolder = true
+        let folder = URL(fileURLWithPath: existingFolderPath)
+        let card = sourcePath.isEmpty ? nil : URL(fileURLWithPath: sourcePath)
+        let media = cardFiles
+        Task.detached(priority: .userInitiated) {
+            let listing = ExistingFolder.list(folder, excluding: card)
+            let plan = ExistingFolder.plan(media, listing: listing)
+            await MainActor.run {
+                guard generation == self.searchGeneration, self.cardFiles.map(\.id) == media.map(\.id) else { return }
+                self.searchingFolder = false
+                self.apply(plan, listing: listing)
+                done?(listing)
+            }
+        }
+    }
+
+    private func apply(_ plan: ExistingFolder.Plan, listing: ExistingFolder.Listing) {
         for i in cardFiles.indices {
             let id = cardFiles[i].id
             cardFiles[i].destName = plan.alreadyThere[id].map(listing.relativePath) ?? plan.destNames[id] ?? cardFiles[i].name
@@ -345,7 +377,6 @@ final class AppModel {
         if phase == .ready {
             for f in cardFiles { statuses[f.id] = plan.alreadyThere[f.id] != nil ? .alreadyThere : .pending }
         }
-        return listing
     }
 
     /// The card and folder of the last finished import, offered to the independent check.
@@ -470,16 +501,24 @@ final class AppModel {
 
     /// Copies only the card files the folder doesn't already have. Never replaces or deletes anything in it.
     private func startImportIntoExisting() {
-        let dest = URL(fileURLWithPath: existingFolderPath)
+        guard !searchingFolder else { return }
         if phase == .done {
             resetResults()
             phase = .ready
         }
-        // Re-read the folder now, in case it changed since it was chosen.
-        guard let listing = planDestination() else {
-            alertMessage = existingFolderError ?? "Choose a folder to add to."
-            return
+        // Search the folder again now, in case it changed since it was chosen, then start.
+        planDestination { listing in
+            guard let listing else {
+                self.alertMessage = self.existingFolderError ?? "Choose a folder to add to."
+                return
+            }
+            self.beginImportIntoExisting(listing)
         }
+    }
+
+    private func beginImportIntoExisting(_ listing: ExistingFolder.Listing) {
+        guard phase == .ready || phase == .done else { return }
+        let dest = URL(fileURLWithPath: existingFolderPath)
         // Same name and size is only a candidate: run() compares checksums before calling it "already there".
         let toCopy = cardFiles.filter { alreadyThere[$0.id] == nil }
         let candidates = cardFiles.compactMap { f in alreadyThere[f.id].map { (card: f, folder: candidateLists[f.id] ?? [$0]) } }
@@ -568,15 +607,28 @@ final class AppModel {
                 var match: DestFile?
                 do {
                     let progress: (Int64) -> Void = { n in Task { @MainActor in self.bytesDone += n } }
-                    let onCard = try hasher(c.card.url, token, progress)
-                    for (i, d) in c.folder.enumerated() where !claimed.contains(d.url.path) {
-                        if i > 0 { await MainActor.run { self.bytesTotal += d.size } }
+                    // The first megabyte rules out most look-alikes; only those that match it are hashed in full.
+                    let cardHead = try Importer.hashPrefix(c.card.url)
+                    var onCardFull: String?
+                    var hashedBytes: Int64 = 0                    // what was really read in full, for the progress total
+                    defer {
+                        let correction = hashedBytes - c.card.size * 2   // the total assumed two full reads
+                        Task { @MainActor in self.bytesTotal += correction }
+                    }
+                    for d in c.folder where !claimed.contains(d.url.path) {
+                        guard (try? Importer.hashPrefix(d.url)) == cardHead else { continue }
+                        if onCardFull == nil {
+                            onCardFull = try hasher(c.card.url, token, progress)
+                            hashedBytes += c.card.size
+                        }
+                        let onCard = onCardFull!
                         let inFolder: String
                         if let known = folderHashes[d.url.path] {
                             inFolder = known
                         } else {
                             // A folder file that can't be read just isn't a match; the card file then gets copied.
                             do { inFolder = try hasher(d.url, token, progress) } catch is CancellationError { throw CancellationError() } catch { continue }
+                            hashedBytes += d.size
                             folderHashes[d.url.path] = inFolder
                         }
                         if inFolder == onCard { match = d; break }
