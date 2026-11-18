@@ -59,6 +59,8 @@ final class Updater {
         /// Asks the app to quit. Returns only if quitting was refused.
         var quit: @MainActor () -> Void = { NSApp.terminate(nil) }
         var relaunchCommand = "/usr/bin/open"
+        /// How the helper moves apps (tests use a stand-in that fails on purpose).
+        var moveCommand = "/bin/mv"
         /// The shell command the helper runs to tell the user a swap failed after the app quit
         /// (nothing else is left to tell them). Takes the message to show.
         var failureAlertCommand: (String) -> String = { message in
@@ -320,15 +322,16 @@ final class Updater {
         log "waiting for pid \(pid) to quit"
         while /bin/kill -0 \(pid) 2>/dev/null; do /bin/sleep 0.2; done
         log "app quit; swapping"
-        if ! /bin/mv \(current) \(old); then log "couldn't move the old app aside"; \(nothingChanged); exit 1; fi
-        if /bin/mv \(Self.shellQuote(newApp.path)) \(current); then
+        mv=\(Self.shellQuote(env.moveCommand))
+        if ! "$mv" \(current) \(old); then log "couldn't move the old app aside"; \(nothingChanged); exit 1; fi
+        if "$mv" \(Self.shellQuote(newApp.path)) \(current); then
             /bin/rm -rf \(old)
             log "swapped; relaunching"
-        elif /bin/mv \(old) \(current); then
+        elif "$mv" \(old) \(current); then
             log "couldn't move the new app in; old app restored"
             \(kept)
         else
-            log "couldn't move the new app in or put the old one back; it is at \(oldPath)"
+            log "couldn't move the new app in or put the old one back; it is at "\(old)
             \(lost)
             exit 1
         fi

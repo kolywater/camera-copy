@@ -170,6 +170,81 @@ final class AppModelTests: TempDirTestCase {
         XCTAssertEqual(try Data(contentsOf: other), theirs, "the folder's own photo is untouched")
     }
 
+    func testMatchInASubfolderIsConfirmedAndNotCopied() async throws {
+        try makeCard()
+        let shoot = out.appendingPathComponent("Shoot")
+        let sub = shoot.appendingPathComponent("2024/Day 1")
+        try FileManager.default.createDirectory(at: sub, withIntermediateDirectories: true)
+        try FileManager.default.copyItem(at: card.appendingPathComponent("PRIVATE/M4ROOT/CLIP/C0001.MP4"), to: sub.appendingPathComponent("C0001.MP4"))
+        let m = try await readyModel()
+        m.existingFolderPath = shoot.path
+        m.destinationMode = .existingFolder
+        let clip = try XCTUnwrap(m.cardFiles.first { $0.name == "C0001.MP4" })
+        XCTAssertEqual(clip.destName, "2024/Day 1/C0001.MP4")
+        m.startImport()
+        try await wait(m, for: .done)
+        XCTAssertTrue(m.allVerified, "\(m.statuses)")
+        XCTAssertEqual(m.statuses[clip.id], .alreadyThere)
+        XCTAssertEqual(m.destFiles[clip.id]?.url.standardizedFileURL, sub.appendingPathComponent("C0001.MP4").standardizedFileURL)
+        XCTAssertFalse(try names(in: shoot).contains("C0001.MP4"), "not copied again into the top folder")
+    }
+
+    func testSameNameInASubfolderWithDifferentBytesIsCopiedToTheTopFolder() async throws {
+        try makeCard()
+        let shoot = out.appendingPathComponent("Shoot")
+        let other = try makeFile("old/C0001.MP4", size: 9000, in: shoot)        // same name and size, other clip
+        let theirs = try Data(contentsOf: other)
+        let m = try await readyModel()
+        m.existingFolderPath = shoot.path
+        m.destinationMode = .existingFolder
+        let clip = try XCTUnwrap(m.cardFiles.first { $0.name == "C0001.MP4" })
+        XCTAssertNotNil(m.alreadyThere[clip.id])
+        m.startImport()
+        try await wait(m, for: .done)
+        XCTAssertTrue(m.allVerified, "\(m.statuses)")
+        XCTAssertNotEqual(m.statuses[clip.id], .alreadyThere)
+        let copy = shoot.appendingPathComponent("C0001.MP4")
+        XCTAssertEqual(try Data(contentsOf: copy), try Data(contentsOf: clip.url), "copied into the top folder, its own name free there")
+        XCTAssertEqual(try Data(contentsOf: other), theirs, "the subfolder's clip is untouched")
+    }
+
+    func testASecondCandidateMatchesWhenTheFirstDiffers() async throws {
+        try makeCard()
+        let shoot = out.appendingPathComponent("Shoot")
+        try makeFile("a/C0001.MP4", size: 9000, in: shoot)                   // looks the same, isn't
+        try FileManager.default.createDirectory(at: shoot.appendingPathComponent("b"), withIntermediateDirectories: true)
+        try FileManager.default.copyItem(at: card.appendingPathComponent("PRIVATE/M4ROOT/CLIP/C0001.MP4"),
+                                         to: shoot.appendingPathComponent("b/C0001.MP4"))
+        let m = try await readyModel()
+        m.existingFolderPath = shoot.path
+        m.destinationMode = .existingFolder
+        m.startImport()
+        try await wait(m, for: .done)
+        let clip = try XCTUnwrap(m.cardFiles.first { $0.name == "C0001.MP4" })
+        XCTAssertEqual(m.statuses[clip.id], .alreadyThere)
+        XCTAssertEqual(m.destFiles[clip.id]?.url.lastPathComponent, "C0001.MP4")
+        XCTAssertTrue(m.destFiles[clip.id]?.url.path.hasSuffix("/b/C0001.MP4") == true)
+        XCTAssertFalse(try names(in: shoot).contains("C0001.MP4"))
+    }
+
+    func testEachFolderFileStandsInForOnlyOneCardFile() async throws {
+        // Two card files with identical contents (a duplicate), one copy somewhere in the folder.
+        let dup = try makeFile("CARD/DCIM/100MSDCF/DSC5.JPG", size: 300, modified: day(1))
+        try FileManager.default.createDirectory(at: card.appendingPathComponent("DCIM/101MSDCF"), withIntermediateDirectories: true)
+        try FileManager.default.copyItem(at: dup, to: card.appendingPathComponent("DCIM/101MSDCF/DSC5.JPG"))
+        let shoot = out.appendingPathComponent("Shoot")
+        try FileManager.default.createDirectory(at: shoot.appendingPathComponent("x"), withIntermediateDirectories: true)
+        try FileManager.default.copyItem(at: dup, to: shoot.appendingPathComponent("x/DSC5.JPG"))
+        let m = try await readyModel()
+        m.existingFolderPath = shoot.path
+        m.destinationMode = .existingFolder
+        m.startImport()
+        try await wait(m, for: .done)
+        XCTAssertTrue(m.allVerified)
+        XCTAssertEqual(m.alreadyThereCount, 1)
+        XCTAssertEqual(m.verifiedCount, 1, "the second card file is copied, not matched to the same folder file")
+    }
+
     func testAComparisonThatFailsCanBeRetried() async throws {
         try makeCard()
         let shoot = out.appendingPathComponent("Shoot")

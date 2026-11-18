@@ -4,34 +4,55 @@ import Foundation
 /// Nothing here touches the disk except reading the folder listing.
 enum ExistingFolder {
     struct Listing {
-        /// Regular, non-hidden files at the top level of the folder, keyed by lowercased name.
-        var files: [String: DestFile]
-        /// Every name at the top level (files, folders, hidden items), lowercased. New copies never use one.
+        var root: URL
+        /// Every regular, non-hidden file in the folder and all its subfolders, keyed by lowercased
+        /// name (several files can share a name in different subfolders). Top-level files come first,
+        /// then deeper ones, in path order.
+        var files: [String: [DestFile]]
+        /// Every name at the top level (files, folders, hidden items), lowercased. New copies go in the
+        /// top folder and never use one of these.
         var takenNames: Set<String>
+
+        /// "2025/Trip/DSC1.ARW" for a file in a subfolder, "DSC1.ARW" at the top.
+        func relativePath(_ d: DestFile) -> String {
+            let rootPath = root.standardizedFileURL.path, p = d.url.standardizedFileURL.path
+            return p.hasPrefix(rootPath + "/") ? String(p.dropFirst(rootPath.count + 1)) : d.name
+        }
     }
 
     struct Plan {
-        /// Card file id -> the file already in the folder that counts as the same photo/video.
+        /// Card file id -> the folder file shown as its match before importing (a same-name-and-size
+        /// candidate, confirmed or not by checksum during the import).
         var alreadyThere: [String: DestFile]
-        /// Card file id -> the name a new copy gets. Never one of `Listing.takenNames`.
+        /// Card file id -> every same-name-and-size folder file, best first. The import compares them
+        /// by checksum in this order; each folder file can stand in for only one card file.
+        var candidates: [String: [DestFile]]
+        /// Card file id -> the name a new copy gets in the top folder. Never one of `Listing.takenNames`.
         var destNames: [String: String]
     }
 
+    /// Lists the folder and every subfolder, like verify-card.sh searches the destination. Hidden files
+    /// and folders (which covers ._ files, .DS_Store, .Spotlight-V100, .Trashes, .fseventsd) are skipped,
+    /// and symlinked folders aren't followed, so a link can't make it loop. Unreadable subfolders are
+    /// skipped too: a file that can't be found there is simply copied again, the safe direction.
     static func list(_ dir: URL) -> Listing {
         let fm = FileManager.default
         let keys: [URLResourceKey] = [.isRegularFileKey, .fileSizeKey, .contentModificationDateKey]
-        let urls = (try? fm.contentsOfDirectory(at: dir, includingPropertiesForKeys: keys, options: [])) ?? []
-        var files: [String: DestFile] = [:]
         var taken = Set<String>()
-        for url in urls {
-            let name = url.lastPathComponent
-            taken.insert(name.lowercased())
-            guard !name.hasPrefix("."),
-                  let v = try? url.resourceValues(forKeys: Set(keys)), v.isRegularFile == true else { continue }
-            files[name.lowercased()] = DestFile(url: url, name: name, size: Int64(v.fileSize ?? 0),
-                                                modified: v.contentModificationDate ?? .distantPast)
+        for name in (try? fm.contentsOfDirectory(atPath: dir.path)) ?? [] { taken.insert(name.lowercased()) }
+
+        var found: [DestFile] = []
+        if let walk = fm.enumerator(at: dir, includingPropertiesForKeys: keys, options: [.skipsHiddenFiles],
+                                    errorHandler: { _, _ in true }) {
+            for case let url as URL in walk {
+                guard let v = try? url.resourceValues(forKeys: Set(keys)), v.isRegularFile == true else { continue }
+                found.append(DestFile(url: url, name: url.lastPathComponent, size: Int64(v.fileSize ?? 0),
+                                      modified: v.contentModificationDate ?? .distantPast))
+            }
         }
-        return Listing(files: files, takenNames: taken)
+        let depth = { (d: DestFile) in d.url.pathComponents.count }
+        found.sort { depth($0) != depth($1) ? depth($0) < depth($1) : $0.url.path < $1.url.path }
+        return Listing(root: dir, files: Dictionary(grouping: found) { $0.name.lowercased() }, takenNames: taken)
     }
 
     /// A candidate for "already there" is a file in the folder with the same name (ignoring case) and
@@ -46,29 +67,35 @@ enum ExistingFolder {
     /// Files still to copy get a name nobody in the folder uses. A RAW+JPEG pair keeps the suffix its
     /// partner already has in the folder when that name is free, so the pair stays matched.
     static func plan(_ media: [CardFile], listing: Listing) -> Plan {
-        var used = Set<String>()                 // folder files already claimed by a card file
-        var alreadyThere: [String: DestFile] = [:]
-
-        // 1. Exact name + size.
+        // "-N" names made by an earlier import: "dsc00001.arw" -> [(2, …/DSC00001-2.ARW), …]
+        var suffixed: [String: [(n: Int, file: DestFile)]] = [:]
+        for (key, ds) in listing.files {
+            guard let (original, n) = unsuffixed(key) else { continue }
+            for d in ds { suffixed[original, default: []].append((n, d)) }
+        }
+        // Every same-size candidate, best first: the exact name (top folder first), then "-2", "-3"…
+        var candidates: [String: [DestFile]] = [:]
+        var exact: [String: [DestFile]] = [:]
         for f in media {
             let key = f.name.lowercased()
-            if let d = listing.files[key], d.size == f.size, !used.contains(key) {
-                alreadyThere[f.id] = d
-                used.insert(key)
-            }
+            exact[f.id] = (listing.files[key] ?? []).filter { $0.size == f.size }
+            let dashed = (suffixed[key] ?? []).filter { $0.file.size == f.size }.sorted { $0.n < $1.n }.map(\.file)
+            let all = exact[f.id]! + dashed
+            if !all.isEmpty { candidates[f.id] = all }
         }
 
-        // 2. A "-N" name made by an earlier import, same size.
-        var suffixed: [String: [(n: Int, file: DestFile)]] = [:]   // "dsc00001.arw" -> [(2, DSC00001-2.ARW)]
-        for (key, d) in listing.files {
-            guard let (original, n) = unsuffixed(key) else { continue }
-            suffixed[original, default: []].append((n, d))
+        // The match shown before importing: exact names first for every card file, then "-N" names,
+        // each folder file used once.
+        var used = Set<String>()                 // folder file paths already claimed by a card file
+        var alreadyThere: [String: DestFile] = [:]
+        for f in media {
+            if let d = exact[f.id]?.first(where: { !used.contains($0.url.path) }) {
+                alreadyThere[f.id] = d; used.insert(d.url.path)
+            }
         }
         for f in media where alreadyThere[f.id] == nil {
-            let candidates = (suffixed[f.name.lowercased()] ?? []).sorted { $0.n < $1.n }
-            if let hit = candidates.first(where: { $0.file.size == f.size && !used.contains($0.file.name.lowercased()) }) {
-                alreadyThere[f.id] = hit.file
-                used.insert(hit.file.name.lowercased())
+            if let d = candidates[f.id]?.first(where: { !used.contains($0.url.path) }) {
+                alreadyThere[f.id] = d; used.insert(d.url.path)
             }
         }
 
@@ -103,7 +130,7 @@ enum ExistingFolder {
                 taken.insert(name.lowercased())
             }
         }
-        return Plan(alreadyThere: alreadyThere, destNames: destNames)
+        return Plan(alreadyThere: alreadyThere, candidates: candidates, destNames: destNames)
     }
 
     /// Files sharing a card folder and base name (a RAW+JPEG pair) form one group, as in CardScanner.

@@ -432,6 +432,40 @@ final class UpdaterTests: TempDirTestCase {
         XCTAssertFalse(r.relaunched)
     }
 
+    /// marlowe v1.3 #3/#4: run the "can't put the old app back" branch for real, in a folder whose
+    /// name would run commands if any path were left unquoted.
+    func testHelperNamesTheOldAppIfItCantBePutBackForReal() throws {
+        let hostile = "Apps $(touch PWNED) `touch PWNED2` \"q\" 'a'"
+        let current = try makeApp("\(hostile)/CameraCopy.app", marker: "old")
+        // A stand-in mv that refuses any move onto the app's own path (both the swap-in and the restore).
+        let fakeMove = tmp.appendingPathComponent("mv-fails-onto-app.sh")
+        try Data("#!/bin/sh\ncase \"$2\" in */CameraCopy.app) exit 1;; esac\nexec /bin/mv \"$@\"\n".utf8).write(to: fakeMove)
+        try shell("/bin/chmod", ["755", fakeMove.path])
+        let alerted = tmp.appendingPathComponent("alerted"), relaunched = tmp.appendingPathComponent("relaunched")
+        var env = Updater.Environment()
+        env.moveCommand = fakeMove.path
+        env.relaunchCommand = "/usr/bin/touch \(Updater.shellQuote(relaunched.path)); /usr/bin/true"
+        env.failureAlertCommand = { "/usr/bin/printf '%s' \(Updater.shellQuote($0)) > \(Updater.shellQuote(alerted.path))" }
+        let new = try makeApp("new/CameraCopy.app", marker: "new")
+        let script = Updater(currentVersion: "1.0", appURL: current, env: env).helperScript(newApp: new, afterPID: 999_999)
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/bin/sh"); p.arguments = ["-c", script]
+        p.currentDirectoryURL = tmp
+        try p.run(); p.waitUntilExit()
+
+        XCTAssertEqual(p.terminationStatus, 1)
+        let message = try String(contentsOf: alerted, encoding: .utf8)
+        XCTAssertTrue(message.contains("couldn’t be put back. It is at \(current.path).old-"), message)
+        let left = try names(in: current.deletingLastPathComponent())
+        XCTAssertEqual(left.count, 1)
+        XCTAssertTrue(left[0].hasPrefix("CameraCopy.app.old-"), "the old app is where the alert says: \(left)")
+        XCTAssertEqual(marker(current.deletingLastPathComponent().appendingPathComponent(left[0])), "old")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: relaunched.path), "no relaunch of an app that isn't there")
+        for leak in ["PWNED", "PWNED2"] {
+            XCTAssertFalse(FileManager.default.fileExists(atPath: tmp.appendingPathComponent(leak).path), "\(leak): a path was run as a command")
+        }
+    }
+
     /// If the old app can't be put back either, the alert says where it is instead of "kept".
     func testHelperNamesTheOldAppIfItCantBePutBack() {
         var env = Updater.Environment()
@@ -441,6 +475,6 @@ final class UpdaterTests: TempDirTestCase {
         let lostBranch = script.components(separatedBy: "else\n").last ?? ""
         XCTAssertTrue(lostBranch.contains("couldn’t be put back. It is at /Applications/CameraCopy.app.old-"), script)
         XCTAssertTrue(lostBranch.contains("exit 1"), "and it doesn't try to open an app that isn't there")
-        XCTAssertTrue(script.contains("elif /bin/mv"), "putting the old app back is itself checked")
+        XCTAssertTrue(script.contains("elif \"$mv\""), "putting the old app back is itself checked")
     }
 }

@@ -85,6 +85,10 @@ release version:
     # Nothing ships unless every unit test passes.
     if ! just test; then echo "Error: tests failed, so nothing was released."; exit 1; fi
 
+    # From here until the commit, any exit (a failed step, Ctrl-C, a kill) puts the version back.
+    committed=0
+    trap '[ "$committed" = 1 ] || { git checkout HEAD -- project.yml; echo "Version bump undone; nothing was released."; }' EXIT
+    trap 'exit 130' INT TERM
     echo "Setting MARKETING_VERSION to $version"
     sed -i '' -E "s/(MARKETING_VERSION: )\"?[0-9.]+\"?/\1\"$version\"/" project.yml
     grep -q "MARKETING_VERSION: \"$version\"" project.yml || { echo "Error: couldn't set the version in project.yml"; exit 1; }
@@ -92,24 +96,27 @@ release version:
     # Only a notarized, stapled build may be published. On any failure, undo the version bump and stop:
     # nothing is committed, tagged, pushed or released.
     if ! just package; then
-        git checkout -- project.yml
         echo "Error: the build or notarization failed, so nothing was released (no tag, no GitHub release)."; exit 1
     fi
     if ! xcrun stapler validate -q "{{dist_app}}" || ! spctl --assess --type execute "{{dist_app}}" 2>/dev/null; then
-        git checkout -- project.yml
         echo "Error: the app isn't notarized (is the 'notary' keychain profile set up? xcrun notarytool store-credentials notary),"
         echo "so nothing was released (no tag, no GitHub release)."; exit 1
     fi
     built=$(/usr/libexec/PlistBuddy -c "Print CFBundleShortVersionString" "{{dist_app}}/Contents/Info.plist")
-    if [[ "$built" != "$version" ]]; then git checkout -- project.yml; echo "Error: built app says $built, expected $version"; exit 1; fi
+    if [[ "$built" != "$version" ]]; then echo "Error: built app says $built, expected $version"; exit 1; fi
     zip="dist/CameraCopy-$version.zip"
     cp dist/CameraCopy.zip "$zip"
 
     git add project.yml
     git diff --cached --quiet || git commit -m "Release $tag"
+    committed=1
     git tag "$tag"
     git push origin HEAD
     git push origin "$tag"
 
-    gh release create "$tag" "$zip" --title "Camera Copy $version" --generate-notes
+    if ! gh release create "$tag" "$zip" --title "Camera Copy $version" --generate-notes; then
+        echo "Error: $tag is tagged and pushed, but the GitHub release wasn't created. To finish it, run:"
+        echo "  gh release create $tag $zip --title \"Camera Copy $version\" --generate-notes"
+        exit 1
+    fi
     echo "Released $tag"

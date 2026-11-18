@@ -84,24 +84,62 @@ final class IndependentCheckTests: TempDirTestCase {
         XCTAssertTrue(c.latestLine.contains("same folder"))
     }
 
-    func testStateComesFromExitCodeNotText() async throws {
-        // A stand-in script that prints "OK" but exits 1, and one that prints MISSING but exits 0.
-        let liar = tmp.appendingPathComponent("liar.sh")
-        try Data("echo 'OK: all 5 files are there'; exit 1\n".utf8).write(to: liar)
-        let c = IndependentCheck(scriptURL: liar)
+    private func state(ofScript body: String) async throws -> IndependentCheck {
+        let script = tmp.appendingPathComponent("stand-in-\(UUID().uuidString).sh")
+        try Data(body.utf8).write(to: script)
+        let c = IndependentCheck(scriptURL: script)
         c.run(card: tmp.path, folder: tmp.path)
         try await wait(c)
-        XCTAssertEqual(c.state, .missing)
-        try Data("echo 'MISSING: x'; exit 0\n".utf8).write(to: liar)
-        let d = IndependentCheck(scriptURL: liar)
-        d.run(card: tmp.path, folder: tmp.path)
-        try await wait(d)
-        XCTAssertEqual(d.state, .passed)
-        try Data("exit 7\n".utf8).write(to: liar)
-        let e = IndependentCheck(scriptURL: liar)
-        e.run(card: tmp.path, folder: tmp.path)
-        try await wait(e)
-        XCTAssertEqual(e.state, .error, "any other exit code is an error")
+        return c
+    }
+
+    func testGreenNeedsExitZeroAndTheOKLine() async throws {
+        let ok = try await state(ofScript: "echo 'OK: all 5 files are there'; exit 0\n")
+        XCTAssertEqual(ok.state, .passed)
+        let saysOKButExits1 = try await state(ofScript: "echo 'OK: all 5 files are there'; exit 1\n")
+        XCTAssertEqual(saysOKButExits1.state, .missing, "exit 1 is red, whatever the text says")
+        let silentZero = try await state(ofScript: "exit 0\n")
+        XCTAssertEqual(silentZero.state, .error, "exit 0 without the OK line isn't trusted")
+        XCTAssertTrue(silentZero.problem?.contains("without saying OK") == true)
+        let missingButZero = try await state(ofScript: "echo 'MISSING: x'; exit 0\n")
+        XCTAssertEqual(missingButZero.state, .error)
+        let other = try await state(ofScript: "exit 7\n")
+        XCTAssertEqual(other.state, .error, "any other exit code is an error")
+    }
+
+    /// marlowe's v1.3 #1: each of these, set in Camera Copy's environment, used to turn a missing file green.
+    func testCameraCopysEnvironmentCantChangeTheVerdict() async throws {
+        let (card, folder) = try makeCardAndImport()
+        try FileManager.default.removeItem(at: folder.appendingPathComponent("C0001.MP4"))
+        let bashEnv = tmp.appendingPathComponent("evil-bash-env")
+        try Data("grep() { return 0; }\n".utf8).write(to: bashEnv)
+        let attacks: [(String, String)] = [
+            ("SHELLOPTS", "noexec"),
+            ("BASH_ENV", bashEnv.path),
+            ("BASH_FUNC_grep%%", "() { return 0; }"),
+            ("GREP_OPTIONS", "-v"),
+        ]
+        for (name, value) in attacks {
+            setenv(name, value, 1)
+            defer { unsetenv(name) }
+            let c = IndependentCheck(scriptURL: bundledScript)
+            c.run(card: card.path, folder: folder.path)
+            try await wait(c)
+            XCTAssertEqual(c.state, .missing, "\(name)=\(value) must not change the result: \(c.output)")
+            XCTAssertEqual(c.missingFiles.count, 1, name)
+        }
+    }
+
+    func testTheScriptGetsOnlyTheFixedEnvironment() async throws {
+        setenv("CAMERACOPY_SHOULD_NOT_LEAK", "1", 1)
+        defer { unsetenv("CAMERACOPY_SHOULD_NOT_LEAK") }
+        let c = try await state(ofScript: "env | sort; echo 'OK: done'\n")
+        let names = Set(c.output.split(separator: "\n").filter { $0.contains("=") }
+            .compactMap { $0.split(separator: "=").first.map(String.init) })
+        XCTAssertFalse(names.contains("CAMERACOPY_SHOULD_NOT_LEAK"))
+        XCTAssertTrue(Set(IndependentCheck.environment.keys).isSubset(of: names))
+        // bash adds a few of its own (PWD, SHLVL, _); nothing else from Camera Copy comes through.
+        XCTAssertTrue(names.subtracting(IndependentCheck.environment.keys).isSubset(of: ["PWD", "SHLVL", "_", "OLDPWD"]), "\(names)")
     }
 
     func testStoppingNeverCountsAsPassed() async throws {
@@ -130,7 +168,7 @@ final class IndependentCheckTests: TempDirTestCase {
         let c = IndependentCheck(scriptURL: slow)
         c.run(card: tmp.path, folder: tmp.path)
         try await Task.sleep(for: .milliseconds(200))
-        try Data("echo new; exit 0\n".utf8).write(to: slow)
+        try Data("echo 'OK: new'; exit 0\n".utf8).write(to: slow)
         c.run(card: tmp.path, folder: tmp.path)
         try await wait(c)
         XCTAssertEqual(c.state, .passed)

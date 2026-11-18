@@ -114,6 +114,66 @@ final class ExistingFolderTests: TempDirTestCase {
         XCTAssertEqual(ExistingFolder.plan(media, listing: ExistingFolder.list(dest)).alreadyThere[id(media, "Y.JPG")]?.name, "Y-02.JPG")
     }
 
+    // MARK: Subfolders (searched like verify-card.sh searches the destination)
+
+    func testFindsAMatchInASubfolderAndNestedDeep() throws {
+        let media = try makeCard()
+        let card1 = media.first { $0.relativePath == "DCIM/100MSDCF/DSC00001.ARW" }!
+        let clip = media.first { $0.name == "C0001.MP4" }!
+        try FileManager.default.createDirectory(at: dest, withIntermediateDirectories: true)
+        try FileManager.default.copyItem(at: card1.url, to: dest.appendingPathComponent("2024/Trip/DSC00001.ARW", isDirectory: false)
+            .deletingLastPathComponent().creatingDirectory().appendingPathComponent("DSC00001.ARW"))
+        let deep = dest.appendingPathComponent("a/b/c/d/e/f").creatingDirectory()
+        try FileManager.default.copyItem(at: clip.url, to: deep.appendingPathComponent("C0001.MP4"))
+        let listing = ExistingFolder.list(dest)
+        let plan = ExistingFolder.plan(media, listing: listing)
+        XCTAssertEqual(plan.alreadyThere[card1.id].map(listing.relativePath), "2024/Trip/DSC00001.ARW")
+        XCTAssertEqual(plan.alreadyThere[clip.id].map(listing.relativePath), "a/b/c/d/e/f/C0001.MP4")
+        XCTAssertFalse(listing.takenNames.contains("dsc00001.arw"), "new-name checks look only at the top folder")
+        XCTAssertEqual(plan.destNames[card1.id], nil, "a candidate gets no new name unless the checksum says it differs")
+    }
+
+    func testCandidatesListEveryCopyTopFolderFirst() throws {
+        try makeFile("CARD/DCIM/DSC9.JPG", size: 100, modified: day(1))
+        let media = try CardScanner.scan(root: card).media
+        try makeFile("z/DSC9.JPG", size: 100, in: dest)
+        try makeFile("a/DSC9.JPG", size: 100, in: dest)
+        try makeFile("DSC9.JPG", size: 100, in: dest)
+        try makeFile("b/DSC9.JPG", size: 99, in: dest)               // other size: not a candidate
+        let listing = ExistingFolder.list(dest)
+        let plan = ExistingFolder.plan(media, listing: listing)
+        XCTAssertEqual(plan.candidates[media[0].id]?.map(listing.relativePath), ["DSC9.JPG", "a/DSC9.JPG", "z/DSC9.JPG"])
+    }
+
+    func testSkipsHiddenFoldersAndMacJunk() throws {
+        try makeFile("CARD/DCIM/DSC9.JPG", size: 100, modified: day(1))
+        let media = try CardScanner.scan(root: card).media
+        for junk in [".hidden/DSC9.JPG", ".Trashes/501/DSC9.JPG", ".Spotlight-V100/DSC9.JPG", ".fseventsd/DSC9.JPG", "sub/._DSC9.JPG"] {
+            try makeFile(junk, size: 100, in: dest)
+        }
+        let listing = ExistingFolder.list(dest)
+        XCTAssertNil(listing.files["dsc9.jpg"], "nothing hidden is searched")
+        XCTAssertTrue(ExistingFolder.plan(media, listing: listing).alreadyThere.isEmpty)
+    }
+
+    func testSymlinkLoopsAndLinkedFoldersAreNotFollowed() throws {
+        try makeFile("CARD/DCIM/DSC9.JPG", size: 100, modified: day(1))
+        let media = try CardScanner.scan(root: card).media
+        try makeFile("sub/DSC9.JPG", size: 100, in: dest)
+        let fm = FileManager.default
+        try fm.createSymbolicLink(at: dest.appendingPathComponent("sub/loop"), withDestinationURL: dest)       // a loop
+        let elsewhere = try makeFile("elsewhere/DSC9.JPG", size: 100).deletingLastPathComponent()
+        try fm.createSymbolicLink(at: dest.appendingPathComponent("linked"), withDestinationURL: elsewhere)  // outside
+        try fm.createSymbolicLink(at: dest.appendingPathComponent("DSC9.JPG"), withDestinationURL: elsewhere.appendingPathComponent("DSC9.JPG"))
+        let started = Date()
+        let listing = ExistingFolder.list(dest)
+        XCTAssertLessThan(Date().timeIntervalSince(started), 5, "the loop isn't walked")
+        XCTAssertEqual(listing.files["dsc9.jpg"]?.map(listing.relativePath), ["sub/DSC9.JPG"],
+                       "only the real file: no loop, no linked folder, no linked file")
+        XCTAssertTrue(listing.takenNames.contains("dsc9.jpg"), "but the link's name is still taken at the top")
+        XCTAssertEqual(ExistingFolder.plan(media, listing: listing).alreadyThere.count, 1)
+    }
+
     func testFreeName() {
         XCTAssertEqual(ExistingFolder.freeName("DSC1.ARW", taken: []), "DSC1-2.ARW")
         XCTAssertEqual(ExistingFolder.freeName("DSC1.ARW", taken: ["dsc1-2.arw", "dsc1-3.arw"]), "DSC1-4.ARW")
@@ -128,5 +188,13 @@ final class ExistingFolderTests: TempDirTestCase {
     func testListingOfMissingFolderIsEmpty() {
         let l = ExistingFolder.list(tmp.appendingPathComponent("nope"))
         XCTAssertTrue(l.files.isEmpty && l.takenNames.isEmpty)
+    }
+}
+
+private extension URL {
+    /// Creates this folder (and its parents) and returns it.
+    func creatingDirectory() -> URL {
+        try! FileManager.default.createDirectory(at: self, withIntermediateDirectories: true)
+        return self
     }
 }

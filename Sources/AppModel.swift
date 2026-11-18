@@ -34,6 +34,8 @@ final class AppModel {
     var existingFolderPath = ""
     /// Existing-folder mode: card file id -> the file the folder already has (same name and size).
     var alreadyThere: [String: DestFile] = [:]
+    /// Existing-folder mode: card file id -> every same-name-and-size file anywhere in the folder, best first.
+    @ObservationIgnored private var candidateLists: [String: [DestFile]] = [:]
 
     var phase: Phase = .idle
     var cardFiles: [CardFile] = []
@@ -328,6 +330,7 @@ final class AppModel {
         guard destinationMode == .existingFolder, existingFolderError == nil else {
             for i in cardFiles.indices { cardFiles[i].destName = scannedDestNames[cardFiles[i].id] ?? cardFiles[i].name }
             alreadyThere = [:]
+            candidateLists = [:]
             if phase == .ready { for f in cardFiles where statuses[f.id] == .alreadyThere { statuses[f.id] = .pending } }
             return nil
         }
@@ -335,9 +338,10 @@ final class AppModel {
         let plan = ExistingFolder.plan(cardFiles, listing: listing)
         for i in cardFiles.indices {
             let id = cardFiles[i].id
-            cardFiles[i].destName = plan.alreadyThere[id]?.name ?? plan.destNames[id] ?? cardFiles[i].name
+            cardFiles[i].destName = plan.alreadyThere[id].map(listing.relativePath) ?? plan.destNames[id] ?? cardFiles[i].name
         }
         alreadyThere = plan.alreadyThere
+        candidateLists = plan.candidates
         if phase == .ready {
             for f in cardFiles { statuses[f.id] = plan.alreadyThere[f.id] != nil ? .alreadyThere : .pending }
         }
@@ -478,7 +482,7 @@ final class AppModel {
         }
         // Same name and size is only a candidate: run() compares checksums before calling it "already there".
         let toCopy = cardFiles.filter { alreadyThere[$0.id] == nil }
-        let candidates = cardFiles.compactMap { f in alreadyThere[f.id].map { (card: f, folder: $0) } }
+        let candidates = cardFiles.compactMap { f in alreadyThere[f.id].map { (card: f, folder: candidateLists[f.id] ?? [$0]) } }
 
         let needed = toCopy.reduce(0) { $0 + $1.size }
         if let free = try? dest.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey])
@@ -506,14 +510,15 @@ final class AppModel {
         let failed = cardFiles.filter(isProblem)
         for f in failed { statuses[f.id] = .pending }
         // A file that was only a same-name-and-size candidate is compared again, never copied over.
-        let candidates = failed.compactMap { f in alreadyThere[f.id].map { (card: f, folder: $0) } }
+        let candidates = failed.compactMap { f in alreadyThere[f.id].map { (card: f, folder: candidateLists[f.id] ?? [$0]) } }
         run(failed.filter { alreadyThere[$0.id] == nil }, into: dest, confirming: candidates)
     }
 
-    /// Copies `files` into `dest`. First, each of `candidates` (a card file and a folder file with the
-    /// same name and size) is compared by SHA-256: the same contents count as already there; different
-    /// contents are copied under a new, free name, and the folder's own file is left alone.
-    private func run(_ files: [CardFile], into dest: URL, confirming candidates: [(card: CardFile, folder: DestFile)] = []) {
+    /// Copies `files` into `dest`. First, each of `candidates` (a card file and the folder files, anywhere
+    /// in the folder, with the same name and size) is compared by SHA-256: if one has the same contents
+    /// it counts as already there (each folder file only once); otherwise the card file is copied
+    /// under a new, free name in the top folder, and the folder's own files are left alone.
+    private func run(_ files: [CardFile], into dest: URL, confirming candidates: [(card: CardFile, folder: [DestFile])] = []) {
         independentCheck.reset()       // its result belonged to the folder as it was before this import
         bytesDone = 0
         bytesTotal = files.reduce(0) { $0 + $1.size } * 3   // copy + read back the copy + re-read the card
@@ -550,6 +555,8 @@ final class AppModel {
         Task.detached(priority: .userInitiated) {
             // 1. Compare each same-name-and-size candidate with the folder's file, by checksum.
             var different: [CardFile] = []
+            var claimed = Set<String>()                      // folder files already standing in for a card file
+            var folderHashes: [String: String] = [:]
             for (index, c) in candidates.enumerated() {
                 if token.isCancelled { break }
                 await MainActor.run {
@@ -558,11 +565,24 @@ final class AppModel {
                     self.statuses[c.card.id] = .copying
                 }
                 let status: VerifyStatus
+                var match: DestFile?
                 do {
                     let progress: (Int64) -> Void = { n in Task { @MainActor in self.bytesDone += n } }
                     let onCard = try hasher(c.card.url, token, progress)
-                    let inFolder = try hasher(c.folder.url, token, progress)
-                    if onCard == inFolder {
+                    for (i, d) in c.folder.enumerated() where !claimed.contains(d.url.path) {
+                        if i > 0 { await MainActor.run { self.bytesTotal += d.size } }
+                        let inFolder: String
+                        if let known = folderHashes[d.url.path] {
+                            inFolder = known
+                        } else {
+                            // A folder file that can't be read just isn't a match; the card file then gets copied.
+                            do { inFolder = try hasher(d.url, token, progress) } catch is CancellationError { throw CancellationError() } catch { continue }
+                            folderHashes[d.url.path] = inFolder
+                        }
+                        if inFolder == onCard { match = d; break }
+                    }
+                    if let match {
+                        claimed.insert(match.url.path)
                         status = .alreadyThere
                     } else {
                         different.append(c.card)
@@ -571,16 +591,24 @@ final class AppModel {
                 } catch is CancellationError {
                     status = .failed("Cancelled")
                 } catch {
-                    status = .failed("Couldn't compare with \(c.folder.name): \(error.localizedDescription)")
+                    status = .failed("Couldn't compare with the folder: \(error.localizedDescription)")
                 }
-                await MainActor.run { self.statuses[c.card.id] = status }
+                let matched = match
+                await MainActor.run {
+                    self.statuses[c.card.id] = status
+                    if let matched, let i = self.cardFiles.firstIndex(where: { $0.id == c.card.id }) {
+                        self.alreadyThere[c.card.id] = matched
+                        self.cardFiles[i].destName = ExistingFolder.Listing(root: dest, files: [:], takenNames: []).relativePath(matched)
+                    }
+                }
             }
             // Different photos that only share a name and size get a new name and are copied.
             let differing = different
             let renamed: [CardFile] = await MainActor.run {
                 var taken = preexisting.union(self.cardFiles.map { $0.destName.lowercased() })
                 return differing.map { card in
-                    let name = ExistingFolder.freeName(card.destName, taken: taken)
+                    // New copies go in the top folder: the card's own name if it's free there, else "-2", "-3"…
+                    let name = taken.contains(card.name.lowercased()) ? ExistingFolder.freeName(card.name, taken: taken) : card.name
                     taken.insert(name.lowercased())
                     self.alreadyThere[card.id] = nil
                     self.bytesTotal += card.size * 3
@@ -659,6 +687,16 @@ final class AppModel {
         var found: [String: DestFile] = [:]
 
         for file in cardFiles {
+            // Confirmed already there, possibly in a subfolder: look at that very file again.
+            if statuses[file.id] == .alreadyThere, let match = alreadyThere[file.id] {
+                guard let d = Importer.destFile(at: match.url) else {
+                    statuses[file.id] = .failed("No longer in the folder")
+                    continue
+                }
+                if d.size != file.size { statuses[file.id] = .failed("Size in folder (\(d.size)) differs from card (\(file.size))") }
+                found[file.id] = d
+                continue
+            }
             let key = file.destName.lowercased()
             expected.insert(key)
             guard let d = listing[key] else {

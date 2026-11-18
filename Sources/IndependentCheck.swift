@@ -5,8 +5,13 @@ import OSLog
 
 /// Runs the bundled `verify-card.sh` (a copy of tools/verify-card.sh, byte for byte) as its own
 /// process: `/bin/bash verify-card.sh <card> <folder>`. Camera Copy only launches it and shows what
-/// it prints. None of Camera Copy's own code or checksums are involved in the verdict, and the
-/// state comes from the script's exit code (0 OK, 1 missing, anything else an error), not from its text.
+/// it prints. None of Camera Copy's own code or checksums are involved in the verdict. The state
+/// comes from the script's exit code (1 missing, anything but 0 or 1 an error); green needs both
+/// exit 0 and the script's own "OK:" verdict line, so a run that exits 0 without checking can't pass.
+///
+/// The script never sees Camera Copy's environment: it gets a fixed, minimal one, and bash runs with
+/// --noprofile --norc -p, so BASH_ENV, SHELLOPTS (e.g. noexec) or exported shell functions can't
+/// change what it does.
 @Observable
 @MainActor
 final class IndependentCheck {
@@ -39,6 +44,13 @@ final class IndependentCheck {
         self.scriptSHA256 = scriptURL.flatMap { try? Data(contentsOf: $0) }
             .map { SHA256.hash(data: $0).map { String(format: "%02x", $0) }.joined() }
     }
+
+    /// Everything the script's process gets, and nothing else: Apple's own tools, a UTF-8 locale, a temp folder.
+    nonisolated static let environment: [String: String] = [
+        "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
+        "LANG": "en_US.UTF-8",
+        "TMPDIR": NSTemporaryDirectory(),
+    ]
 
     var isRunning: Bool { if case .running = state { return true } else { return false } }
 
@@ -76,10 +88,8 @@ final class IndependentCheck {
         }
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/bin/bash")
-        p.arguments = [scriptURL.path, card, folder]
-        var env = ProcessInfo.processInfo.environment
-        env["PATH"] = "/usr/bin:/bin:/usr/sbin:/sbin"     // only Apple's own tools
-        p.environment = env
+        p.arguments = ["--noprofile", "--norc", "-p", scriptURL.path, card, folder]
+        p.environment = Self.environment
         let pipe = Pipe()
         p.standardOutput = pipe
         p.standardError = pipe
@@ -134,7 +144,11 @@ final class IndependentCheck {
             state = .error
         } else {
             switch code {
-            case 0: state = .passed
+            case 0 where latestLine.hasPrefix("OK: "):
+                state = .passed
+            case 0:
+                problem = "The check ended without saying OK, so its result can't be trusted. See the full output."
+                state = .error
             case 1: state = .missing
             default: state = .error
             }

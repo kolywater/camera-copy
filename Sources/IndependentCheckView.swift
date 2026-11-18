@@ -209,7 +209,7 @@ struct IndependentCheckReport: View {
     private var about: some View {
         VStack(alignment: .leading, spacing: 3) {
             Text("About this check").font(.caption.weight(.semibold))
-            Text("Camera Copy runs verify-card.sh, a short script you can read, as a separate process. It fingerprints every file on the card and in the folder with Apple's shasum and uses none of Camera Copy's own code or checksums. The result comes from the script's exit code: 0 all there, 1 missing, 2 couldn't check.")
+            Text("Camera Copy runs verify-card.sh, a short script you can read, as a separate process. It fingerprints every file on the card and in the folder with Apple's shasum and uses none of Camera Copy's own code or checksums. It runs with its own minimal environment. Green needs exit code 0 and the script's own OK line; 1 means missing; anything else means it couldn't check.")
                 .fixedSize(horizontal: false, vertical: true)
             Text("Script SHA-256: \(check.scriptSHA256 ?? "unavailable")")
                 .font(.caption2.monospaced()).textSelection(.enabled)
